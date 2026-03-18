@@ -2,8 +2,8 @@ from aiogram import F, Router
 from aiogram.types import Message
 
 from bot.db.models import UserRole
-from bot.db.repo import create_application_for_client, get_or_create_user
-from bot.keyboards import client_menu
+from bot.db.repo import get_or_create_user
+from bot.keyboards import Btn, client_menu
 
 router = Router()
 
@@ -13,36 +13,14 @@ async def _ensure_client(message: Message) -> bool:
     return user.role == UserRole.client
 
 
-@router.message(F.text == "Консультация")
-async def client_consultation(message: Message) -> None:
-    if not await _ensure_client(message):
-        return
-    await message.answer("Опишите ваш вопрос одним сообщением.", reply_markup=client_menu())
-
-
-@router.message(F.text == "Рассчитать стоимость")
-async def client_calc_price(message: Message) -> None:
-    if not await _ensure_client(message):
-        return
-    await message.answer("Уточните параметры — я подготовлю расчёт (заглушка).", reply_markup=client_menu())
-
-
-@router.message(F.text == "Оставить заявку")
-async def client_leave_application(message: Message) -> None:
-    if not await _ensure_client(message):
-        return
-    app = await create_application_for_client(message.from_user.id)
-    await message.answer(f"Заявка №{app.id} создана и отправлена агенту.", reply_markup=client_menu())
-
-
-@router.message(F.text == "Мои договоры")
+@router.message(F.text == Btn.MY_CONTRACTS)
 async def client_contracts(message: Message) -> None:
     if not await _ensure_client(message):
         return
     await message.answer("Раздел «Мои договоры» (заглушка).", reply_markup=client_menu())
 
 
-@router.message(F.text == "Мои документы")
+@router.message(F.text == Btn.MY_DOCS)
 async def client_documents(message: Message) -> None:
     if not await _ensure_client(message):
         return

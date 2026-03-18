@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     bot_token: str
     database_url: str
     log_level: str = "INFO"
+    timezone: str = "Europe/Minsk"
 
     @field_validator("database_url")
     @classmethod

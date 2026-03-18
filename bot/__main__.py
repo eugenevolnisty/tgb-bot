@@ -2,10 +2,12 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot.config import get_settings
 from bot.db.base import init_db
 from bot.handlers.router import router
+from bot.scheduler.reminders import reminders_worker
 
 
 async def main() -> None:
@@ -15,8 +17,10 @@ async def main() -> None:
     await init_db()
 
     bot = Bot(token=settings.bot_token)
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    asyncio.create_task(reminders_worker(bot))
 
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
