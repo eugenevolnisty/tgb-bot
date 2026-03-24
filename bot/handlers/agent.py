@@ -77,7 +77,50 @@ async def agent_incoming(message: Message) -> None:
                     + f"- Итог: {premium:.2f} {a.quote.currency}\n"
                     + f"- Quote ID: {a.quote.id}"
                 )
-            elif a.quote.quote_type.value in {"cargo", "accident", "cmr", "dms", "other"}:
+            elif a.quote.quote_type.value == "accident":
+                name = payload.get("full_name")
+                contact = payload.get("contact")
+                details = (
+                    "\n🧮 ✈️ Страховка за границу расчёт:\n"
+                    + (f"- Имя: {name}\n" if name else "")
+                    + (f"- Контакт: {contact}\n" if contact else "")
+                    + f"- Срок поездки: {payload.get('days', '?')} дней\n"
+                    + f"- Возраст: {payload.get('age', '?')}\n"
+                    + f"- Вариант A: {'да' if payload.get('variant_a') else 'нет'}"
+                    + (
+                        f" (сумма {payload.get('sum_a')})\n"
+                        if payload.get("variant_a")
+                        else "\n"
+                    )
+                    + f"- Вариант B: {'да' if payload.get('variant_b') else 'нет'}"
+                    + (
+                        f" (сумма {payload.get('sum_b')})\n"
+                        if payload.get("variant_b")
+                        else "\n"
+                    )
+                    + f"- Территория AB5: вариант {payload.get('ab5_option', '?')}\n"
+                    + f"- Спорт (A2): {'да' if payload.get('sport_training') else 'нет'}\n"
+                    + f"- Кол-во застрахованных: {payload.get('insured_count', '?')}\n"
+                    + f"- Повторный договор (AB3.1): {'да' if payload.get('repeat_contract') else 'нет'}\n"
+                    + f"- Электронный полис (AB3.2): {'да' if payload.get('e_policy') else 'нет'}\n"
+                    + f"- Итог: {premium:.2f} {a.quote.currency}\n"
+                    + f"- Quote ID: {a.quote.id}"
+                )
+            elif a.quote.quote_type.value == "expeditor":
+                name = payload.get("full_name")
+                contact = payload.get("contact")
+                details = (
+                    "\n🧮 🚛 Ответственность экспедитора расчёт:\n"
+                    + (f"- Имя: {name}\n" if name else "")
+                    + (f"- Контакт: {contact}\n" if contact else "")
+                    + f"- Пакет: {payload.get('plan_title', '?')}\n"
+                    + f"- Лимит на случай: {payload.get('per_case_limit', '?')} USD/EUR\n"
+                    + f"- Агрегатный лимит: {payload.get('aggregate_limit', '?')} USD/EUR\n"
+                    + f"- Франшиза: {payload.get('franchise', '?')} USD/EUR\n"
+                    + f"- Итог: {premium:.2f} {a.quote.currency}\n"
+                    + f"- Quote ID: {a.quote.id}"
+                )
+            elif a.quote.quote_type.value in {"cargo", "cmr", "dms", "other"}:
                 name = payload.get("full_name")
                 contact = payload.get("contact")
                 subject = payload.get("subject", "?")
@@ -86,7 +129,7 @@ async def agent_incoming(message: Message) -> None:
                 extra = payload.get("extra_type")
                 kind_map = {
                     "cargo": "📦 Грузы",
-                    "accident": "🩹 Несчастные случаи",
+                    "accident": "✈️ Страховка за границу",
                     "cmr": "🚚 CMR",
                     "dms": "🩺 ДМС",
                     "other": "✍️ Другой вид",
@@ -170,7 +213,50 @@ async def agent_in_progress(message: Message) -> None:
                     + f"- Итог: {premium:.2f} {a.quote.currency}\n"
                     + f"- Quote ID: {a.quote.id}"
                 )
-            elif a.quote.quote_type.value in {"cargo", "accident", "cmr", "dms", "other"}:
+            elif a.quote.quote_type.value == "accident":
+                name = payload.get("full_name")
+                contact = payload.get("contact")
+                details = (
+                    "\n🧮 ✈️ Страховка за границу расчёт:\n"
+                    + (f"- Имя: {name}\n" if name else "")
+                    + (f"- Контакт: {contact}\n" if contact else "")
+                    + f"- Срок поездки: {payload.get('days', '?')} дней\n"
+                    + f"- Возраст: {payload.get('age', '?')}\n"
+                    + f"- Вариант A: {'да' if payload.get('variant_a') else 'нет'}"
+                    + (
+                        f" (сумма {payload.get('sum_a')})\n"
+                        if payload.get("variant_a")
+                        else "\n"
+                    )
+                    + f"- Вариант B: {'да' if payload.get('variant_b') else 'нет'}"
+                    + (
+                        f" (сумма {payload.get('sum_b')})\n"
+                        if payload.get("variant_b")
+                        else "\n"
+                    )
+                    + f"- Территория AB5: вариант {payload.get('ab5_option', '?')}\n"
+                    + f"- Спорт (A2): {'да' if payload.get('sport_training') else 'нет'}\n"
+                    + f"- Кол-во застрахованных: {payload.get('insured_count', '?')}\n"
+                    + f"- Повторный договор (AB3.1): {'да' if payload.get('repeat_contract') else 'нет'}\n"
+                    + f"- Электронный полис (AB3.2): {'да' if payload.get('e_policy') else 'нет'}\n"
+                    + f"- Итог: {premium:.2f} {a.quote.currency}\n"
+                    + f"- Quote ID: {a.quote.id}"
+                )
+            elif a.quote.quote_type.value == "expeditor":
+                name = payload.get("full_name")
+                contact = payload.get("contact")
+                details = (
+                    "\n🧮 🚛 Ответственность экспедитора расчёт:\n"
+                    + (f"- Имя: {name}\n" if name else "")
+                    + (f"- Контакт: {contact}\n" if contact else "")
+                    + f"- Пакет: {payload.get('plan_title', '?')}\n"
+                    + f"- Лимит на случай: {payload.get('per_case_limit', '?')} USD/EUR\n"
+                    + f"- Агрегатный лимит: {payload.get('aggregate_limit', '?')} USD/EUR\n"
+                    + f"- Франшиза: {payload.get('franchise', '?')} USD/EUR\n"
+                    + f"- Итог: {premium:.2f} {a.quote.currency}\n"
+                    + f"- Quote ID: {a.quote.id}"
+                )
+            elif a.quote.quote_type.value in {"cargo", "cmr", "dms", "other"}:
                 name = payload.get("full_name")
                 contact = payload.get("contact")
                 subject = payload.get("subject", "?")
@@ -179,7 +265,7 @@ async def agent_in_progress(message: Message) -> None:
                 extra = payload.get("extra_type")
                 kind_map = {
                     "cargo": "📦 Грузы",
-                    "accident": "🩹 Несчастные случаи",
+                    "accident": "✈️ Страховка за границу",
                     "cmr": "🚚 CMR",
                     "dms": "🩺 ДМС",
                     "other": "✍️ Другой вид",

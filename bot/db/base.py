@@ -37,7 +37,7 @@ async def init_db() -> None:
 
         # Extend enum quote_type for existing DBs (PostgreSQL).
         # If not PostgreSQL, this will likely fail silently at runtime; we ignore errors.
-        for v in ["property", "cargo", "accident", "cmr", "dms", "other"]:
+        for v in ["property", "cargo", "accident", "expeditor", "cmr", "dms", "other"]:
             try:
                 async with conn.begin_nested():
                     await conn.execute(text(f"ALTER TYPE quote_type ADD VALUE IF NOT EXISTS '{v}'"))

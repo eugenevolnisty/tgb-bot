@@ -195,7 +195,9 @@ async def create_application_from_quote(tg_id: int, quote_id: int) -> Applicatio
             elif q.quote_type == QuoteType.cargo:
                 title = "Грузы — заявка по расчёту"
             elif q.quote_type == QuoteType.accident:
-                title = "Несчастные случаи — заявка по расчёту"
+                title = "Страховка за границу — заявка по расчёту"
+            elif q.quote_type == QuoteType.expeditor:
+                title = "Ответственность экспедитора — заявка по расчёту"
             elif q.quote_type == QuoteType.cmr:
                 title = "CMR — заявка по расчёту"
             elif q.quote_type == QuoteType.dms:

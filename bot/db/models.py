@@ -63,6 +63,7 @@ class QuoteType(str, enum.Enum):
     property = "property"
     cargo = "cargo"
     accident = "accident"
+    expeditor = "expeditor"
     cmr = "cmr"
     dms = "dms"
     other = "other"

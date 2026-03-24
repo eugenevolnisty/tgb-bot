@@ -79,7 +79,7 @@ async def pick_calc_type(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
 
-    if t in {"cargo", "accident", "cmr", "dms", "other"}:
+    if t in {"cargo", "accident", "expeditor", "cmr", "dms", "other"}:
         await state.clear()
         from bot.handlers.generic_calcs import start_generic_from_callback
 

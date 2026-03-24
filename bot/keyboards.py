@@ -93,12 +93,15 @@ def insurance_type_keyboard(prefix: str) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📦 Грузы", callback_data=f"{prefix}:type:cargo"),
-            InlineKeyboardButton(text="🩹 Несчастные случаи", callback_data=f"{prefix}:type:accident"),
+            InlineKeyboardButton(text="✈️ Страховка за границу", callback_data=f"{prefix}:type:accident"),
         ],
         [
             InlineKeyboardButton(text="🚚 CMR", callback_data=f"{prefix}:type:cmr"),
             InlineKeyboardButton(text="🩺 ДМС", callback_data=f"{prefix}:type:dms"),
         ],
-        [InlineKeyboardButton(text="✍️ Другой вид", callback_data=f"{prefix}:type:other")],
+        [
+            InlineKeyboardButton(text="🚛 Ответственность экспедитора", callback_data=f"{prefix}:type:expeditor"),
+            InlineKeyboardButton(text="✍️ Другой вид", callback_data=f"{prefix}:type:other"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
