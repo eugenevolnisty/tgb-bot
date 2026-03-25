@@ -44,6 +44,14 @@ async def init_db() -> None:
             except Exception:
                 pass
 
+        # Extend payment_status for existing DBs (if table/payment_status already existed).
+        for v in ["pending", "paid"]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(f"ALTER TYPE payment_status ADD VALUE IF NOT EXISTS '{v}'"))
+            except Exception:
+                pass
+
         for v in ["sent", "cancelled"]:
             try:
                 async with conn.begin_nested():
@@ -74,4 +82,16 @@ async def init_db() -> None:
                 )
         except Exception:
             # If column exists but has different type, skip automatic migration.
+            pass
+
+        # Contract: vehicle description for KASKO.
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS contracts "
+                        "ADD COLUMN IF NOT EXISTS vehicle_description TEXT NULL"
+                    )
+                )
+        except Exception:
             pass

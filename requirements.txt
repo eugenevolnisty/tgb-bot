@@ -6,3 +6,4 @@ pydantic>=2.6.0
 pydantic-settings>=2.2.1
 greenlet>=3.0.3
 tzdata>=2024.1
+openpyxl>=3.1.0

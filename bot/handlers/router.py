@@ -8,6 +8,8 @@ from bot.handlers.application_flow import router as application_router
 from bot.handlers.property_calc import router as property_router
 from bot.handlers.generic_calcs import router as generic_router
 from bot.handlers.reminders import router as reminders_router
+from bot.handlers.clients import router as clients_router
+from bot.handlers.payment_reports import router as payment_reports_router
 
 router = Router()
 router.include_router(start_router)
@@ -18,4 +20,6 @@ router.include_router(application_router)
 router.include_router(property_router)
 router.include_router(generic_router)
 router.include_router(reminders_router)
+router.include_router(clients_router)
+router.include_router(payment_reports_router)
 

@@ -1,7 +1,7 @@
 import json
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.db.models import ApplicationStatus, UserRole
 from bot.db.repo import get_or_create_user, list_incoming_applications, list_in_progress_applications, set_application_status
@@ -327,13 +327,34 @@ async def app_status_change(callback: CallbackQuery) -> None:
 async def agent_clients(message: Message) -> None:
     if not await _ensure_agent(message):
         return
-    await message.answer("Раздел «Мои клиенты» (заглушка).", reply_markup=agent_menu())
+    from bot.handlers.clients import open_clients_menu
+
+    await open_clients_menu(message)
 
 @router.message(F.text == Btn.REPORTS)
 async def agent_reports(message: Message) -> None:
     if not await _ensure_agent(message):
         return
-    await message.answer("Раздел «Отчёты» (заглушка).", reply_markup=agent_menu())
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="+1 день", callback_data="payrep:1"),
+                InlineKeyboardButton(text="+3 дня", callback_data="payrep:3"),
+                InlineKeyboardButton(text="+7 дней", callback_data="payrep:7"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="agent:reports_back")],
+        ]
+    )
+    await message.answer("Отчёты по взносам за ближайшие дни:", reply_markup=kb)
+
+
+@router.callback_query(F.data == "agent:reports_back")
+async def agent_reports_back(callback: CallbackQuery) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await callback.message.answer("Меню.", reply_markup=agent_menu())
+    await callback.answer()
 
 
 @router.message(F.text == Btn.SETTINGS)

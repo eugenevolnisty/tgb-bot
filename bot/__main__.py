@@ -8,6 +8,7 @@ from bot.config import get_settings
 from bot.db.base import init_db
 from bot.handlers.router import router
 from bot.scheduler.reminders import reminders_worker
+from bot.scheduler.payment_reminders import payment_reminders_worker
 
 
 async def main() -> None:
@@ -21,6 +22,7 @@ async def main() -> None:
     dp.include_router(router)
 
     asyncio.create_task(reminders_worker(bot))
+    asyncio.create_task(payment_reminders_worker(bot))
 
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
