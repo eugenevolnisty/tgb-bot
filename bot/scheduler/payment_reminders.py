@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 
 _MARKER_PREFIX = "PAYMENTS_SWEEP:"
+_CLIENT_MARKER_PREFIX = "CLIENT_PAYMENTS_SWEEP:"
 
 
 @dataclass(frozen=True)
@@ -240,6 +241,10 @@ async def get_pending_payments_due_between(agent_tg_id: int, start: date, end: d
         start, end = end, start
 
     async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return []
         res = await session.execute(
             select(Payment, Contract, Client)
             .join(Contract, Contract.id == Payment.contract_id)
@@ -247,6 +252,7 @@ async def get_pending_payments_due_between(agent_tg_id: int, start: date, end: d
             .join(User, User.id == Client.agent_user_id)
             .where(
                 User.tg_id == agent_tg_id,
+                User.tenant_id == agent.tenant_id,
                 Payment.status == PaymentStatus.pending,
                 Contract.status == ContractStatus.active,
                 Payment.due_date >= start,
@@ -281,6 +287,10 @@ async def get_contracts_ending_between(agent_tg_id: int, start: date, end: date)
         start, end = end, start
 
     async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return []
         res = await session.execute(
             select(Contract, Client, func.count(Payment.id))
             .join(Client, Client.id == Contract.client_id)
@@ -291,6 +301,7 @@ async def get_contracts_ending_between(agent_tg_id: int, start: date, end: date)
             )
             .where(
                 User.tg_id == agent_tg_id,
+                User.tenant_id == agent.tenant_id,
                 Contract.status == ContractStatus.active,
                 Contract.end_date >= start,
                 Contract.end_date <= end,
@@ -385,6 +396,107 @@ async def _create_sent_marker(session, agent_user_id: int, marker_text: str) -> 
     )
     session.add(r)
     # Caller should commit.
+
+
+def _build_client_payment_lines(payments: list[PaymentRow], limit: int = 10) -> list[str]:
+    payments = sorted(payments, key=lambda p: (p.due_date, p.contract_id))
+    lines: list[str] = []
+    for p in payments[:limit]:
+        lines.append(f"• {p.due_date:%d.%m.%Y}: {p.contract_number} — {_fmt_money(p.amount, p.currency)}")
+    if len(payments) > limit:
+        lines.append(f"… и ещё {len(payments) - limit} взносов")
+    return lines
+
+
+async def _fetch_client_payments_due_between(session, start: date, end: date) -> list[tuple[Payment, Contract, Client, User]]:
+    """
+    Fetch pending payments for clients that are linked to Telegram users via invite flow.
+    Returns tuples: (payment, contract, crm_client, source_user).
+    """
+    from sqlalchemy import select
+
+    if end < start:
+        start, end = end, start
+
+    res = await session.execute(
+        select(Payment, Contract, Client, User)
+        .join(Contract, Contract.id == Payment.contract_id)
+        .join(Client, Client.id == Contract.client_id)
+        .join(User, User.id == Client.source_user_id)
+        .where(
+            Payment.status == PaymentStatus.pending,
+            Contract.status == ContractStatus.active,
+            Client.source_user_id.is_not(None),
+            Payment.due_date >= start,
+            Payment.due_date <= end,
+            User.role == UserRole.client,
+        )
+        .order_by(User.id.asc(), Payment.due_date.asc(), Contract.contract_number.asc())
+    )
+    return list(res.all())
+
+
+async def send_client_payment_reminder_sweep(bot: Bot) -> None:
+    settings = get_settings()
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except ZoneInfoNotFoundError:
+        log.warning("Timezone %r not found, falling back to UTC. Install tzdata on Windows.", settings.timezone)
+        tz = ZoneInfo("UTC")
+
+    local_now = datetime.now(tz)
+    today = local_now.date()
+    marker_text = f"{_CLIENT_MARKER_PREFIX}{today.isoformat()}"
+    end_7 = today + timedelta(days=7)
+
+    async with get_session_maker()() as session:
+        rows = await _fetch_client_payments_due_between(session, today, end_7)
+        if not rows:
+            return
+
+        by_client_user: dict[tuple[int, int], list[PaymentRow]] = defaultdict(list)
+        for payment, contract, client, source_user in rows:
+            key = (source_user.id, source_user.tg_id)
+            by_client_user[key].append(
+                PaymentRow(
+                    contract_id=contract.id,
+                    contract_number=contract.contract_number,
+                    contract_company=contract.company,
+                    contract_kind=contract.contract_kind,
+                    currency=contract.currency,
+                    due_date=payment.due_date,
+                    amount_minor=payment.amount_minor,
+                    client_id=client.id,
+                    client_name=client.full_name,
+                    client_phone=client.phone,
+                )
+            )
+
+        for (user_id, user_tg_id), p_rows in by_client_user.items():
+            if await _marker_exists(session, user_id, marker_text):
+                continue
+            due_1 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=1)]
+            due_3 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=3)]
+            due_7 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=7)]
+            if not due_7:
+                await _create_sent_marker(session, user_id, marker_text)
+                continue
+
+            text = (
+                "⏰ Напоминание о взносах\n"
+                f"{today:%d.%m}—{(today + timedelta(days=1)):%d.%m}: {len(due_1)}\n"
+                f"{today:%d.%m}—{(today + timedelta(days=3)):%d.%m}: {len(due_3)}\n"
+                f"{today:%d.%m}—{(today + timedelta(days=7)):%d.%m}: {len(due_7)}\n\n"
+                "Ближайшие платежи:\n"
+                + "\n".join(_build_client_payment_lines(due_7, limit=8))
+            )
+            try:
+                await bot.send_message(user_tg_id, text)
+            except Exception as send_err:
+                log.warning("Failed to send client payment reminder to tg_id=%s: %s", user_tg_id, send_err)
+            await _create_sent_marker(session, user_id, marker_text)
+
+        await session.commit()
 
 
 async def _fetch_agents(session) -> list[User]:
@@ -663,6 +775,7 @@ async def payment_reminders_worker(bot: Bot, *, run_hour: int = 9, run_minute: i
                 await asyncio.sleep(sleep_seconds)
 
             await send_payment_reminder_sweep(bot)
+            await send_client_payment_reminder_sweep(bot)
         except Exception as e:
             log.exception("Payment reminder worker error: %s", e)
 

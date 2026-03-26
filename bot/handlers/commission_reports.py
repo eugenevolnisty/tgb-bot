@@ -82,6 +82,10 @@ async def get_commission_rows_for_period(agent_tg_id: int, date_from: date, date
     start_utc = start_local.astimezone(timezone.utc)
     end_utc = end_local.astimezone(timezone.utc)
     async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return []
         q = (
             await session.execute(
                 select(Payment, Contract, Client, AgentCommission)
@@ -96,6 +100,7 @@ async def get_commission_rows_for_period(agent_tg_id: int, date_from: date, date
                 )
                 .where(
                     User.tg_id == agent_tg_id,
+                    User.tenant_id == agent.tenant_id,
                     Payment.status == PaymentStatus.paid,
                     Payment.paid_at.is_not(None),
                     Payment.paid_at >= start_utc,

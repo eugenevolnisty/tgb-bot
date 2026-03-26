@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     database_url: str
     log_level: str = "INFO"
     timezone: str = "Europe/Minsk"
+    dev_role_switch_enabled: bool = True
 
     @field_validator("database_url")
     @classmethod

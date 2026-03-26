@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from bot.db.models import Client, ContractStatus, PaymentStatus, UserRole
 from bot.db.repo import (
+    create_client_bind_invite,
     create_client,
     create_client_document,
     create_contract_document,
@@ -25,6 +26,7 @@ from bot.db.repo import (
     get_contract_detailed,
     list_clients,
     list_clients_page,
+    list_invited_client_user_ids,
     list_contracts_for_client,
     list_client_documents,
     list_contract_documents,
@@ -43,6 +45,7 @@ router = Router()
 # In-memory mapping: last shown ordered list of clients per agent.
 # Allows: agent opens "clients list" and then sends "1/2/3..." to open card.
 _LAST_CLIENTS_BY_AGENT: dict[int, list[int]] = {}
+_CLIENTS_FILTER_BY_AGENT: dict[int, str] = {}
 
 # Used to refresh UI after deletion:
 # when user opens a doc photo from the client/contract card,
@@ -135,39 +138,63 @@ async def open_clients_menu(
     limit: int = 20,
     offset: int = 0,
     agent_tg_id: int | None = None,
+    filter_mode: str | None = None,
 ) -> None:
     tg_id = agent_tg_id if agent_tg_id is not None else message.from_user.id
     if not await _ensure_agent_tg(tg_id):
         return
+    mode = filter_mode or _CLIENTS_FILTER_BY_AGENT.get(tg_id, "all")
+    if mode not in {"all", "invited"}:
+        mode = "all"
+    _CLIENTS_FILTER_BY_AGENT[tg_id] = mode
     # Fetch one extra row to detect next page.
-    items_page = await list_clients_page(tg_id, limit=limit + 1, offset=offset)
+    items_page = await list_clients_page(
+        tg_id,
+        limit=limit + 1,
+        offset=offset,
+        invited_only=(mode == "invited"),
+    )
     if not items_page:
         await message.answer("Пока клиентов нет. Добавьте первого.", reply_markup=clients_menu_keyboard())
         return
 
     items = items_page[:limit]
+    invited_user_ids = await list_invited_client_user_ids(tg_id)
     has_next = len(items_page) > limit
     has_prev = offset > 0
 
     lines = ["📋 Клиенты:"]
+    lines.append("Фильтр: только по инвайту" if mode == "invited" else "Фильтр: все")
     # Store client ids in the same order we show them.
     _LAST_CLIENTS_BY_AGENT[tg_id] = [c.id for c in items]
     for i, c in enumerate(items, start=1):
         phone = f" • {c.phone}" if c.phone else ""
-        lines.append(f"{i}) {c.full_name}{phone}")
+        invited_mark = " 🔗" if (getattr(c, "source_user_id", None) in invited_user_ids) else ""
+        lines.append(f"{i}) {c.full_name}{phone}{invited_mark}")
 
     await message.answer("\n".join(lines), reply_markup=clients_menu_keyboard())
 
-    # Separate message with inline pagination controls.
+    kb_rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=("✅ Все" if mode == "all" else "Все"),
+                callback_data="clients:filter:all",
+            ),
+            InlineKeyboardButton(
+                text=("✅ По инвайту" if mode == "invited" else "По инвайту"),
+                callback_data="clients:filter:invited",
+            ),
+        ]
+    ]
     if has_prev or has_next:
-        kb_rows: list[list[InlineKeyboardButton]] = []
+        nav_row: list[InlineKeyboardButton] = []
         if has_prev:
-            kb_rows.append(
-                [InlineKeyboardButton(text="⬅️ Предыдущая", callback_data=f"clients:page:{max(0, offset - limit)}")]
-            )
+            nav_row.append(InlineKeyboardButton(text="⬅️ Предыдущая", callback_data=f"clients:page:{max(0, offset - limit)}"))
         if has_next:
-            kb_rows.append([InlineKeyboardButton(text="➡️ Следующая", callback_data=f"clients:page:{offset + limit}")])
-        await message.answer("Листать список:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+            nav_row.append(InlineKeyboardButton(text="➡️ Следующая", callback_data=f"clients:page:{offset + limit}"))
+        if nav_row:
+            kb_rows.append(nav_row)
+    await message.answer("Список клиентов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 @router.callback_query(F.data.regexp(r"^clients:page:\d+$"))
@@ -190,6 +217,27 @@ async def clients_page(callback: CallbackQuery) -> None:
         limit=20,
         offset=offset,
         agent_tg_id=callback.from_user.id,
+        filter_mode=_CLIENTS_FILTER_BY_AGENT.get(callback.from_user.id, "all"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"clients:filter:all", "clients:filter:invited"}))
+async def clients_filter(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    mode = "invited" if callback.data.endswith("invited") else "all"
+    _CLIENTS_FILTER_BY_AGENT[callback.from_user.id] = mode
+    await open_clients_menu(
+        callback.message,
+        limit=20,
+        offset=0,
+        agent_tg_id=callback.from_user.id,
+        filter_mode=mode,
     )
     await callback.answer()
 
@@ -214,13 +262,14 @@ async def _send_client_card(
         return
 
     contracts = await list_contracts_for_client(agent_tg_id, client_id, limit=10)
+    invited_user_ids = await list_invited_client_user_ids(agent_tg_id)
     documents = await list_client_documents(agent_tg_id, client_id, limit=5)
     if exclude_client_document_ids:
         documents = [d for d in documents if d.id not in exclude_client_document_ids]
 
     lines = [
         f"📇 Клиент #{c.id}",
-        f"👤 {c.full_name}",
+        f"👤 {c.full_name}{' 🔗 по инвайту' if (getattr(c, 'source_user_id', None) in invited_user_ids) else ''}",
         f"📞 {c.phone or '—'}",
         f"📧 {c.email or '—'}",
         "",
@@ -258,6 +307,11 @@ async def _send_client_card(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить договор", callback_data=f"client:add_contract:{c.id}")],
             [InlineKeyboardButton(text="✏️ Редактировать клиента", callback_data=f"client:edit:{c.id}")],
+            *(
+                [[InlineKeyboardButton(text="🔗 Привязать по инвайту", callback_data=f"client:bind_invite:{c.id}")]]
+                if getattr(c, "source_user_id", None) is None
+                else []
+            ),
             *view_buttons,
             [InlineKeyboardButton(text="📎 Добавить фото документов", callback_data=f"client:add_doc:{c.id}")],
             [InlineKeyboardButton(text="🗑 Удалить клиента", callback_data=f"client:delete:{c.id}")],
@@ -287,11 +341,45 @@ async def choose_client_by_index(message: Message, state: FSMContext) -> None:
     await _send_client_card(agent_tg_id=message.from_user.id, client_id=ids[idx], message=message)
 
 
+@router.callback_query(F.data.startswith("client:bind_invite:"))
+async def client_bind_invite_create(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        client_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    inv = await create_client_bind_invite(callback.from_user.id, client_id, ttl_hours=72)
+    if inv is None:
+        await callback.answer("Не удалось создать ссылку. Клиент уже привязан или не найден.", show_alert=True)
+        return
+    token = f"inv_{inv.token}"
+    link = f"/start {token}"
+    try:
+        me = await callback.bot.get_me()
+        if me.username:
+            link = f"https://t.me/{me.username}?start={token}"
+    except Exception:
+        pass
+    await callback.message.answer(
+        "🔗 Уникальная ссылка привязки клиента (72 часа, 1 использование):\n"
+        f"{link}\n\n"
+        "Когда клиент откроет ссылку, эта карточка клиента будет привязана к его Telegram."
+    )
+    await callback.answer("Ссылка создана")
+
+
 @router.message(F.text == ClientsMenu.BACK)
 async def clients_back(message: Message, state: FSMContext) -> None:
     if await state.get_state() is not None:
         await state.clear()
     _LAST_CLIENTS_BY_AGENT.pop(message.from_user.id, None)
+    _CLIENTS_FILTER_BY_AGENT.pop(message.from_user.id, None)
     await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
 
 
@@ -611,7 +699,7 @@ async def open_client_card(callback: CallbackQuery) -> None:
 
     lines = [
         f"📇 Клиент #{c.id}",
-        f"👤 {c.full_name}",
+        f"👤 {c.full_name}{' 🔗 по инвайту' if getattr(c, 'source_user_id', None) is not None else ''}",
         f"📞 {c.phone or '—'}",
         f"📧 {c.email or '—'}",
         "",
@@ -645,6 +733,11 @@ async def open_client_card(callback: CallbackQuery) -> None:
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить договор", callback_data=f"client:add_contract:{c.id}")],
             [InlineKeyboardButton(text="✏️ Редактировать клиента", callback_data=f"client:edit:{c.id}")],
+            *(
+                [[InlineKeyboardButton(text="🔗 Привязать по инвайту", callback_data=f"client:bind_invite:{c.id}")]]
+                if getattr(c, "source_user_id", None) is None
+                else []
+            ),
             *view_buttons,
             [InlineKeyboardButton(text="📎 Добавить фото документов", callback_data=f"client:add_doc:{c.id}")],
             *doc_buttons,

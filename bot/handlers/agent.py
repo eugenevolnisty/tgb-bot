@@ -13,26 +13,34 @@ from openpyxl import Workbook
 from bot.config import get_settings
 from bot.db.models import ApplicationStatus, UserRole
 from bot.db.repo import (
+    create_agent_invite,
     create_application_note,
     create_reminder,
     delete_note_for_agent,
     delete_application,
     get_note_for_agent,
+    get_or_create_public_agent_link,
     get_or_create_user,
     list_incoming_applications,
     list_in_progress_applications,
+    list_invited_client_user_ids,
     list_notes_for_agent,
     list_notes_for_application,
     list_agent_commissions,
+    list_agent_invites,
     list_agent_companies_for_commission,
     list_agent_contract_kinds_for_company,
+    revoke_agent_invite,
+    regenerate_public_agent_link,
     upsert_agent_commission,
+    set_agent_password,
     set_application_status,
 )
 from bot.keyboards import Btn, agent_menu, application_actions_keyboard
 from bot.services.datetime_parse import combine_local, parse_date_ru, parse_relative_ru, parse_time_ru
 from bot.scheduler.payment_reminders import get_pending_payments_due_between
 from bot.handlers.commission_reports import get_commission_rows_for_period
+from bot.services.agent_auth import authorize_agent_session
 
 router = Router()
 
@@ -48,6 +56,10 @@ class AgentCommissionSetup(StatesGroup):
     add_company = State()
     add_kind = State()
     set_percent = State()
+
+
+class AgentAuthSetup(StatesGroup):
+    password = State()
 
 
 def _safe_delete_text(text: str | None) -> str:
@@ -117,6 +129,10 @@ def _settings_root_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💼 Комиссия", callback_data="aset:commission")],
+            [InlineKeyboardButton(text="🔐 Доступ агента", callback_data="aset:auth")],
+            [InlineKeyboardButton(text="🔗 Пригласить клиента", callback_data="aset:invite:create")],
+            [InlineKeyboardButton(text="🌐 Публичная ссылка", callback_data="aset:public_link")],
+            [InlineKeyboardButton(text="📎 Мои инвайты", callback_data="aset:invite:list")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="aset:back")],
         ]
     )
@@ -165,13 +181,15 @@ async def _ensure_agent_tg(tg_id: int) -> bool:
 async def agent_incoming(message: Message) -> None:
     if not await _ensure_agent(message):
         return
-    apps = await list_incoming_applications()
+    apps = await list_incoming_applications(message.from_user.id)
+    invited_user_ids = await list_invited_client_user_ids(message.from_user.id)
     if not apps:
         await message.answer("Новых заявок нет.", reply_markup=agent_menu())
         return
     for a in apps:
         client_tg = a.client.tg_id if a.client is not None else "?"
-        header = f"📌 Заявка №{a.id}\n👤 Клиент: tg_id={client_tg}\n📎 Статус: {a.status.value}"
+        invited_mark = "\n🔗 Клиент: по инвайту" if (a.client is not None and a.client.id in invited_user_ids) else ""
+        header = f"📌 Заявка №{a.id}\n👤 Клиент: tg_id={client_tg}{invited_mark}\n📎 Статус: {a.status.value}"
 
         details = ""
         if a.quote is not None:
@@ -301,13 +319,15 @@ async def agent_incoming(message: Message) -> None:
 async def agent_in_progress(message: Message) -> None:
     if not await _ensure_agent(message):
         return
-    apps = await list_in_progress_applications()
+    apps = await list_in_progress_applications(message.from_user.id)
+    invited_user_ids = await list_invited_client_user_ids(message.from_user.id)
     if not apps:
         await message.answer("Заявок в работе нет.", reply_markup=agent_menu())
         return
     for a in apps:
         client_tg = a.client.tg_id if a.client is not None else "?"
-        header = f"🛠 В работе №{a.id}\n👤 Клиент: tg_id={client_tg}\n📎 Статус: {a.status.value}"
+        invited_mark = "\n🔗 Клиент: по инвайту" if (a.client is not None and a.client.id in invited_user_ids) else ""
+        header = f"🛠 В работе №{a.id}\n👤 Клиент: tg_id={client_tg}{invited_mark}\n📎 Статус: {a.status.value}"
 
         details = ""
         if a.quote is not None:
@@ -459,7 +479,7 @@ async def app_take(callback: CallbackQuery) -> None:
     except Exception:
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    app = await set_application_status(app_id, status=ApplicationStatus.in_progress)
+    app = await set_application_status(callback.from_user.id, app_id, status=ApplicationStatus.in_progress)
     if app is None:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
@@ -508,7 +528,7 @@ async def app_delete(callback: CallbackQuery) -> None:
     except Exception:
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    app = await delete_application(app_id)
+    app = await delete_application(callback.from_user.id, app_id)
     if app is None:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
@@ -728,7 +748,9 @@ async def app_open_one(callback: CallbackQuery) -> None:
     except Exception:
         await callback.answer("Некорректные данные", show_alert=True)
         return
-    apps = await list_incoming_applications(limit=100) + await list_in_progress_applications(limit=100)
+    apps = await list_incoming_applications(callback.from_user.id, limit=100) + await list_in_progress_applications(
+        callback.from_user.id, limit=100
+    )
     app = next((a for a in apps if a.id == app_id), None)
     if app is None:
         await callback.answer("Заявка не найдена", show_alert=True)
@@ -784,8 +806,8 @@ async def agent_dashboard(message: Message) -> None:
     except ZoneInfoNotFoundError:
         tz = ZoneInfo("UTC")
     today = datetime.now(tz).date()
-    incoming = await list_incoming_applications(limit=1000)
-    in_progress = await list_in_progress_applications(limit=1000)
+    incoming = await list_incoming_applications(message.from_user.id, limit=1000)
+    in_progress = await list_in_progress_applications(message.from_user.id, limit=1000)
     overdue = await get_pending_payments_due_between(message.from_user.id, today - timedelta(days=3650), today - timedelta(days=1))
     upcoming7 = await get_pending_payments_due_between(message.from_user.id, today, today + timedelta(days=7))
     com_today = await get_commission_rows_for_period(message.from_user.id, today, today, tz)
@@ -885,6 +907,149 @@ async def settings_commission(callback: CallbackQuery) -> None:
         return
     await callback.message.answer("💼 Комиссии:", reply_markup=_commission_menu_keyboard())
     await callback.answer()
+
+
+@router.callback_query(F.data == "aset:auth")
+async def settings_auth(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AgentAuthSetup.password)
+    await callback.message.answer("Введите новый пароль агента (минимум 6 символов):")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aset:invite:create")
+async def settings_invite_create(callback: CallbackQuery) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    inv = await create_agent_invite(callback.from_user.id, ttl_hours=72, uses_left=1)
+    if inv is None:
+        await callback.answer("Не удалось создать инвайт", show_alert=True)
+        return
+    token = f"inv_{inv.token}"
+    link = f"/start {token}"
+    try:
+        me = await callback.bot.get_me()
+        if me.username:
+            link = f"https://t.me/{me.username}?start={token}"
+    except Exception:
+        pass
+    await callback.message.answer(
+        "🔗 Ссылка для клиента (действует 72 часа, 1 использование):\n"
+        f"{link}\n\n"
+        "Клиент открывает ссылку и автоматически привязывается к вашему пространству данных."
+    )
+    await callback.answer("Инвайт создан")
+
+
+@router.callback_query(F.data == "aset:public_link")
+async def settings_public_link(callback: CallbackQuery) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    inv = await get_or_create_public_agent_link(callback.from_user.id)
+    if inv is None:
+        await callback.answer("Не удалось получить ссылку", show_alert=True)
+        return
+    token = f"public_{inv.token}"
+    link = f"/start {token}"
+    try:
+        me = await callback.bot.get_me()
+        if me.username:
+            link = f"https://t.me/{me.username}?start={token}"
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="♻️ Обновить ссылку", callback_data="aset:public_link:regen")],
+            [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="aset:root")],
+        ]
+    )
+    await callback.message.answer(
+        "🌐 Публичная ссылка агента (для соцсетей):\n"
+        f"{link}\n\n"
+        "Новые клиенты по этой ссылке автоматически привязываются к вам.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "aset:public_link:regen")
+async def settings_public_link_regen(callback: CallbackQuery) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    inv = await regenerate_public_agent_link(callback.from_user.id)
+    if inv is None:
+        await callback.answer("Не удалось обновить ссылку", show_alert=True)
+        return
+    token = f"public_{inv.token}"
+    link = f"/start {token}"
+    try:
+        me = await callback.bot.get_me()
+        if me.username:
+            link = f"https://t.me/{me.username}?start={token}"
+    except Exception:
+        pass
+    await callback.message.answer(f"✅ Новая публичная ссылка:\n{link}")
+    await callback.answer("Ссылка обновлена")
+
+
+@router.callback_query(F.data == "aset:invite:list")
+async def settings_invite_list(callback: CallbackQuery) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    invites = await list_agent_invites(callback.from_user.id, limit=20)
+    if not invites:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Создать инвайт", callback_data="aset:invite:create")],
+                [InlineKeyboardButton(text="⬅️ К настройкам", callback_data="aset:root")],
+            ]
+        )
+        await callback.message.answer("Пока нет инвайтов.", reply_markup=kb)
+        await callback.answer()
+        return
+
+    rows: list[list[InlineKeyboardButton]] = []
+    lines: list[str] = ["📎 Последние инвайты:"]
+    for inv in invites:
+        token_short = inv.token[:8]
+        status_label = {
+            "active": "активен",
+            "used": "использован",
+            "revoked": "отозван",
+            "expired": "истек",
+        }.get(inv.status.value, inv.status.value)
+        lines.append(f"• #{inv.id} [{status_label}] token={token_short}… uses_left={inv.uses_left}")
+        if inv.status.value == "active":
+            rows.append([InlineKeyboardButton(text=f"🗑 Отозвать #{inv.id}", callback_data=f"aset:invite:revoke:{inv.id}")])
+    rows.append([InlineKeyboardButton(text="➕ Создать инвайт", callback_data="aset:invite:create")])
+    rows.append([InlineKeyboardButton(text="⬅️ К настройкам", callback_data="aset:root")])
+    await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("aset:invite:revoke:"))
+async def settings_invite_revoke(callback: CallbackQuery) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        invite_id = int(callback.data.split(":")[-1])
+    except Exception:
+        await callback.answer("Некорректный id", show_alert=True)
+        return
+    ok = await revoke_agent_invite(callback.from_user.id, invite_id)
+    if not ok:
+        await callback.answer("Не удалось отозвать", show_alert=True)
+        return
+    await callback.answer("Инвайт отозван")
+    await settings_invite_list(callback)
 
 
 @router.callback_query(F.data == "aset:back")
@@ -1061,3 +1226,21 @@ async def commission_view(callback: CallbackQuery) -> None:
     except TelegramBadRequest:
         await callback.message.answer(f"Не удалось отправить файл. Записей: {len(rows)}")
     await callback.answer()
+
+
+@router.message(AgentAuthSetup.password)
+async def settings_auth_password(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    pwd = (message.text or "").strip()
+    if len(pwd) < 6:
+        await message.answer("Пароль слишком короткий. Минимум 6 символов.")
+        return
+    ok = await set_agent_password(message.from_user.id, pwd)
+    await state.clear()
+    if not ok:
+        await message.answer("Не удалось сохранить пароль.")
+        return
+    authorize_agent_session(message.from_user.id)
+    await message.answer("✅ Пароль агента сохранён.")
+    await message.answer("⚙️ Настройки:", reply_markup=_settings_root_keyboard())

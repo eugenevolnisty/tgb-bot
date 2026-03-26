@@ -12,11 +12,23 @@ class UserRole(str, enum.Enum):
     client = "client"
 
 
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    users: Mapped[list["User"]] = relationship(back_populates="tenant")
+
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    tenant_id: Mapped[int | None] = mapped_column(ForeignKey("tenants.id", ondelete="SET NULL"), index=True, nullable=True)
     role: Mapped[UserRole | None] = mapped_column(Enum(UserRole, name="user_role"), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -30,8 +42,14 @@ class User(Base):
     applications: Mapped[list["Application"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     quotes: Mapped[list["Quote"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     reminders: Mapped[list["Reminder"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
-    clients: Mapped[list["Client"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
+    clients: Mapped[list["Client"]] = relationship(
+        back_populates="agent",
+        cascade="all, delete-orphan",
+        foreign_keys="Client.agent_user_id",
+    )
     commissions: Mapped[list["AgentCommission"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
+    tenant: Mapped["Tenant | None"] = relationship(back_populates="users")
+    credential: Mapped["AgentCredential | None"] = relationship(back_populates="user", uselist=False, cascade="all, delete-orphan")
 
 
 class ApplicationStatus(str, enum.Enum):
@@ -160,11 +178,68 @@ class AgentCommission(Base):
     agent: Mapped["User"] = relationship(back_populates="commissions")
 
 
+class AgentCredential(Base):
+    __tablename__ = "agent_credentials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    salt: Mapped[str] = mapped_column(String(255), nullable=False)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    user: Mapped["User"] = relationship(back_populates="credential")
+
+
+class InviteStatus(str, enum.Enum):
+    active = "active"
+    used = "used"
+    revoked = "revoked"
+    expired = "expired"
+
+
+class AgentInvite(Base):
+    __tablename__ = "agent_invites"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False)
+    agent_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    target_client_id: Mapped[int | None] = mapped_column(ForeignKey("clients.id", ondelete="SET NULL"), index=True, nullable=True)
+    token: Mapped[str] = mapped_column(String(96), unique=True, index=True, nullable=False)
+    is_public: Mapped[bool] = mapped_column(default=False, nullable=False, index=True)
+    status: Mapped[InviteStatus] = mapped_column(
+        Enum(InviteStatus, name="invite_status"),
+        default=InviteStatus.active,
+        nullable=False,
+    )
+    uses_left: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    tenant: Mapped["Tenant"] = relationship()
+    agent: Mapped["User"] = relationship(foreign_keys=[agent_user_id])
+    used_by_user: Mapped["User | None"] = relationship(foreign_keys=[used_by_user_id])
+
+
 class Client(Base):
     __tablename__ = "clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     agent_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    source_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
 
     full_name: Mapped[str] = mapped_column(String(200), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
@@ -172,7 +247,8 @@ class Client(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    agent: Mapped["User"] = relationship(back_populates="clients")
+    agent: Mapped["User"] = relationship(back_populates="clients", foreign_keys=[agent_user_id])
+    source_user: Mapped["User | None"] = relationship(foreign_keys=[source_user_id])
     contracts: Mapped[list["Contract"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     documents: Mapped[list["ClientDocument"]] = relationship(back_populates="client", cascade="all, delete-orphan")
 

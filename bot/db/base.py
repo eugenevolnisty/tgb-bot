@@ -166,6 +166,168 @@ async def init_db() -> None:
             except Exception:
                 pass
 
+        # Multi-tenant base tables and user binding.
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS tenants ("
+                        "id SERIAL PRIMARY KEY, "
+                        "code VARCHAR(64) NOT NULL UNIQUE, "
+                        "title VARCHAR(200) NOT NULL, "
+                        "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                        ")"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "INSERT INTO tenants (code, title) "
+                        "SELECT 'default', 'Default tenant' "
+                        "WHERE NOT EXISTS (SELECT 1 FROM tenants WHERE code='default')"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS users "
+                        "ADD COLUMN IF NOT EXISTS tenant_id INTEGER NULL REFERENCES tenants(id) ON DELETE SET NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_tenant_id ON users (tenant_id)"))
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "UPDATE users "
+                        "SET tenant_id = (SELECT id FROM tenants WHERE code='default' LIMIT 1) "
+                        "WHERE tenant_id IS NULL"
+                    )
+                )
+        except Exception:
+            pass
+
+        # Agent auth credentials.
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS agent_credentials ("
+                        "id SERIAL PRIMARY KEY, "
+                        "user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, "
+                        "password_hash VARCHAR(255) NOT NULL, "
+                        "salt VARCHAR(255) NOT NULL, "
+                        "failed_attempts INTEGER NOT NULL DEFAULT 0, "
+                        "locked_until TIMESTAMPTZ NULL, "
+                        "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                        "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                        ")"
+                    )
+                )
+        except Exception:
+            pass
+
+        # Agent invite links (tenant onboarding skeleton).
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text("CREATE TYPE invite_status AS ENUM ('active','used','revoked','expired')"))
+        except Exception:
+            pass
+        for v in ["active", "used", "revoked", "expired"]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(f"ALTER TYPE invite_status ADD VALUE IF NOT EXISTS '{v}'"))
+            except Exception:
+                pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS agent_invites ("
+                        "id SERIAL PRIMARY KEY, "
+                        "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                        "agent_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+                        "token VARCHAR(96) NOT NULL UNIQUE, "
+                        "status invite_status NOT NULL DEFAULT 'active', "
+                        "uses_left INTEGER NOT NULL DEFAULT 1, "
+                        "expires_at TIMESTAMPTZ NULL, "
+                        "used_at TIMESTAMPTZ NULL, "
+                        "used_by_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL, "
+                        "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                        ")"
+                    )
+                )
+        except Exception:
+            pass
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS ix_agent_invites_tenant_id ON agent_invites (tenant_id)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_invites_agent_user_id ON agent_invites (agent_user_id)",
+            "CREATE INDEX IF NOT EXISTS ix_agent_invites_used_by_user_id ON agent_invites (used_by_user_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_invites_token ON agent_invites (token)",
+        ]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(idx_sql))
+            except Exception:
+                pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS agent_invites "
+                        "ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT FALSE"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS agent_invites "
+                        "ADD COLUMN IF NOT EXISTS target_client_id INTEGER NULL REFERENCES clients(id) ON DELETE SET NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_invites_is_public ON agent_invites (is_public)"))
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_agent_invites_target_client_id ON agent_invites (target_client_id)"))
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS clients "
+                        "ADD COLUMN IF NOT EXISTS source_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_clients_source_user_id ON clients (source_user_id)"))
+        except Exception:
+            pass
+
         # Contract: insured sum (coverage amount).
         try:
             async with conn.begin_nested():

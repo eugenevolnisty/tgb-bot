@@ -1,13 +1,17 @@
 import json
+import hashlib
+import secrets
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from bot.db.base import get_session_maker
 from bot.db.models import (
+    AgentInvite,
     AgentCommission,
+    AgentCredential,
     ApplicationNote,
     Application,
     ApplicationStatus,
@@ -23,12 +27,25 @@ from bot.db.models import (
     Reminder,
     ReminderRepeat,
     ReminderStatus,
+    InviteStatus,
     User,
     UserRole,
+    Tenant,
 )
 
 from sqlalchemy import or_
 from datetime import date
+
+
+async def _get_default_tenant(session) -> Tenant:
+    res = await session.execute(select(Tenant).where(Tenant.code == "default"))
+    tenant = res.scalar_one_or_none()
+    if tenant is not None:
+        return tenant
+    tenant = Tenant(code="default", title="Default tenant")
+    session.add(tenant)
+    await session.flush()
+    return tenant
 
 
 async def get_or_create_user(tg_id: int) -> User:
@@ -36,8 +53,15 @@ async def get_or_create_user(tg_id: int) -> User:
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         if user is not None:
+            if user.tenant_id is None:
+                tenant = await _get_default_tenant(session)
+                user.tenant_id = tenant.id
+                await session.commit()
+                await session.refresh(user)
             return user
+        tenant = await _get_default_tenant(session)
         user = User(tg_id=tg_id)
+        user.tenant_id = tenant.id
         session.add(user)
         await session.commit()
         await session.refresh(user)
@@ -48,14 +72,404 @@ async def set_user_role(tg_id: int, role: UserRole) -> User:
     async with get_session_maker()() as session:
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
+        tenant = await _get_default_tenant(session)
         if user is None:
-            user = User(tg_id=tg_id, role=role)
+            user = User(tg_id=tg_id, role=role, tenant_id=tenant.id)
             session.add(user)
         else:
             user.role = role
+            if user.tenant_id is None:
+                user.tenant_id = tenant.id
         await session.commit()
         await session.refresh(user)
         return user
+
+
+def _hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200000).hex()
+
+
+async def set_agent_password(agent_tg_id: int, password: str) -> bool:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return False
+        salt = secrets.token_hex(16)
+        ph = _hash_password(password, salt)
+        cred_res = await session.execute(select(AgentCredential).where(AgentCredential.user_id == user.id))
+        cred = cred_res.scalar_one_or_none()
+        if cred is None:
+            cred = AgentCredential(user_id=user.id, password_hash=ph, salt=salt, failed_attempts=0, locked_until=None)
+            session.add(cred)
+        else:
+            cred.password_hash = ph
+            cred.salt = salt
+            cred.failed_attempts = 0
+            cred.locked_until = None
+        await session.commit()
+        return True
+
+
+async def verify_agent_password(agent_tg_id: int, password: str) -> bool:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return False
+        cred_res = await session.execute(select(AgentCredential).where(AgentCredential.user_id == user.id))
+        cred = cred_res.scalar_one_or_none()
+        if cred is None:
+            return False
+        if cred.locked_until is not None and cred.locked_until > datetime.now(timezone.utc):
+            return False
+        ok = secrets.compare_digest(cred.password_hash, _hash_password(password, cred.salt))
+        if ok:
+            cred.failed_attempts = 0
+            cred.locked_until = None
+        else:
+            cred.failed_attempts += 1
+            if cred.failed_attempts >= 5:
+                cred.locked_until = (datetime.now(timezone.utc) + timedelta(minutes=15)).replace(microsecond=0)
+        await session.commit()
+        return ok
+
+
+async def has_agent_password(agent_tg_id: int) -> bool:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return False
+        cred_res = await session.execute(select(AgentCredential.id).where(AgentCredential.user_id == user.id).limit(1))
+        return cred_res.scalar_one_or_none() is not None
+
+
+async def create_agent_invite(
+    agent_tg_id: int,
+    *,
+    ttl_hours: int = 72,
+    uses_left: int = 1,
+    target_client_id: int | None = None,
+) -> AgentInvite | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent or user.tenant_id is None:
+            return None
+        token = secrets.token_urlsafe(24)
+        inv = AgentInvite(
+            tenant_id=user.tenant_id,
+            agent_user_id=user.id,
+            target_client_id=target_client_id,
+            token=token,
+            is_public=False,
+            status=InviteStatus.active,
+            uses_left=max(1, int(uses_left)),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=max(1, int(ttl_hours))),
+        )
+        session.add(inv)
+        await session.commit()
+        await session.refresh(inv)
+        return inv
+
+
+async def get_agent_invite_by_token(token: str) -> AgentInvite | None:
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(AgentInvite)
+            .where(AgentInvite.token == token)
+            .limit(1)
+        )
+        return res.scalar_one_or_none()
+
+
+async def consume_agent_invite(token: str, client_tg_id: int) -> tuple[bool, str]:
+    """
+    Placeholder consume flow:
+    - validates token lifecycle,
+    - binds client user to invite tenant,
+    - marks invite usage counters.
+    """
+    async with get_session_maker()() as session:
+        inv_res = await session.execute(select(AgentInvite).where(AgentInvite.token == token).limit(1))
+        inv = inv_res.scalar_one_or_none()
+        if inv is None:
+            return False, "invite_not_found"
+        if inv.status != InviteStatus.active:
+            return False, "invite_not_active"
+        if inv.expires_at is not None and inv.expires_at <= datetime.now(timezone.utc):
+            inv.status = InviteStatus.expired
+            await session.commit()
+            return False, "invite_expired"
+        if inv.uses_left <= 0:
+            inv.status = InviteStatus.used
+            await session.commit()
+            return False, "invite_depleted"
+
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            user = User(tg_id=client_tg_id, role=UserRole.client, tenant_id=inv.tenant_id)
+            session.add(user)
+            await session.flush()
+        else:
+            if user.tenant_id is None:
+                user.tenant_id = inv.tenant_id
+            elif user.tenant_id != inv.tenant_id:
+                return False, "user_in_other_tenant"
+            if user.role is None:
+                user.role = UserRole.client
+
+        # If invite targets a concrete CRM client, bind exactly this client record.
+        if inv.target_client_id is not None:
+            target_res = await session.execute(
+                select(Client).where(
+                    Client.id == inv.target_client_id,
+                    Client.agent_user_id == inv.agent_user_id,
+                ).limit(1)
+            )
+            target_client = target_res.scalar_one_or_none()
+            if target_client is None:
+                return False, "target_client_not_found"
+            if target_client.source_user_id is not None and target_client.source_user_id != user.id:
+                return False, "target_client_already_bound"
+            target_client.source_user_id = user.id
+        else:
+            # Generic invite: ensure this invited user appears in agent's client base.
+            existing_client_res = await session.execute(
+                select(Client).where(
+                    Client.agent_user_id == inv.agent_user_id,
+                    Client.source_user_id == user.id,
+                ).limit(1)
+            )
+            existing_client = existing_client_res.scalar_one_or_none()
+            if existing_client is None:
+                session.add(
+                    Client(
+                        agent_user_id=inv.agent_user_id,
+                        source_user_id=user.id,
+                        full_name=f"Клиент tg_id={user.tg_id}",
+                        phone=None,
+                        email=None,
+                    )
+                )
+
+        inv.uses_left -= 1
+        inv.used_at = datetime.now(timezone.utc)
+        inv.used_by_user_id = user.id
+        if inv.uses_left <= 0:
+            inv.status = InviteStatus.used
+        await session.commit()
+        return True, "ok"
+
+
+async def create_client_bind_invite(agent_tg_id: int, client_id: int, *, ttl_hours: int = 72) -> AgentInvite | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = user_res.scalar_one_or_none()
+        if agent is None or agent.role != UserRole.agent or agent.tenant_id is None:
+            return None
+        client_res = await session.execute(
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Client.id == client_id,
+                Client.agent_user_id == agent.id,
+                User.tenant_id == agent.tenant_id,
+            )
+            .limit(1)
+        )
+        c = client_res.scalar_one_or_none()
+        if c is None:
+            return None
+        if c.source_user_id is not None:
+            return None
+        return await create_agent_invite(
+            agent_tg_id=agent_tg_id,
+            ttl_hours=ttl_hours,
+            uses_left=1,
+            target_client_id=client_id,
+        )
+
+
+async def revoke_agent_invite(agent_tg_id: int, invite_id: int) -> bool:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent:
+            return False
+        res = await session.execute(
+            select(AgentInvite)
+            .where(
+                AgentInvite.id == invite_id,
+                AgentInvite.agent_user_id == user.id,
+                AgentInvite.tenant_id == user.tenant_id,
+            )
+            .limit(1)
+        )
+        inv = res.scalar_one_or_none()
+        if inv is None:
+            return False
+        inv.status = InviteStatus.revoked
+        await session.commit()
+        return True
+
+
+async def get_or_create_public_agent_link(agent_tg_id: int) -> AgentInvite | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent or user.tenant_id is None:
+            return None
+        res = await session.execute(
+            select(AgentInvite)
+            .where(
+                AgentInvite.agent_user_id == user.id,
+                AgentInvite.tenant_id == user.tenant_id,
+                AgentInvite.is_public.is_(True),
+                AgentInvite.status == InviteStatus.active,
+            )
+            .order_by(AgentInvite.created_at.desc())
+            .limit(1)
+        )
+        inv = res.scalar_one_or_none()
+        if inv is not None:
+            return inv
+        token = secrets.token_urlsafe(24)
+        inv = AgentInvite(
+            tenant_id=user.tenant_id,
+            agent_user_id=user.id,
+            target_client_id=None,
+            token=token,
+            is_public=True,
+            status=InviteStatus.active,
+            uses_left=2_000_000_000,
+            expires_at=None,
+        )
+        session.add(inv)
+        await session.commit()
+        await session.refresh(inv)
+        return inv
+
+
+async def regenerate_public_agent_link(agent_tg_id: int) -> AgentInvite | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent or user.tenant_id is None:
+            return None
+        old_res = await session.execute(
+            select(AgentInvite).where(
+                AgentInvite.agent_user_id == user.id,
+                AgentInvite.tenant_id == user.tenant_id,
+                AgentInvite.is_public.is_(True),
+                AgentInvite.status == InviteStatus.active,
+            )
+        )
+        for old in old_res.scalars().all():
+            old.status = InviteStatus.revoked
+        token = secrets.token_urlsafe(24)
+        inv = AgentInvite(
+            tenant_id=user.tenant_id,
+            agent_user_id=user.id,
+            target_client_id=None,
+            token=token,
+            is_public=True,
+            status=InviteStatus.active,
+            uses_left=2_000_000_000,
+            expires_at=None,
+        )
+        session.add(inv)
+        await session.commit()
+        await session.refresh(inv)
+        return inv
+
+
+async def consume_public_agent_link(token: str, client_tg_id: int) -> tuple[bool, str]:
+    async with get_session_maker()() as session:
+        inv_res = await session.execute(
+            select(AgentInvite)
+            .where(
+                AgentInvite.token == token,
+                AgentInvite.is_public.is_(True),
+            )
+            .limit(1)
+        )
+        inv = inv_res.scalar_one_or_none()
+        if inv is None:
+            return False, "invite_not_found"
+        if inv.status != InviteStatus.active:
+            return False, "invite_not_active"
+
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            user = User(tg_id=client_tg_id, role=UserRole.client, tenant_id=inv.tenant_id)
+            session.add(user)
+            await session.flush()
+        else:
+            if user.tenant_id is None:
+                user.tenant_id = inv.tenant_id
+            elif user.tenant_id != inv.tenant_id:
+                return False, "user_in_other_tenant"
+            if user.role is None:
+                user.role = UserRole.client
+
+        existing_client_res = await session.execute(
+            select(Client).where(
+                Client.agent_user_id == inv.agent_user_id,
+                Client.source_user_id == user.id,
+            ).limit(1)
+        )
+        existing_client = existing_client_res.scalar_one_or_none()
+        if existing_client is None:
+            session.add(
+                Client(
+                    agent_user_id=inv.agent_user_id,
+                    source_user_id=user.id,
+                    full_name=f"Клиент tg_id={user.tg_id}",
+                    phone=None,
+                    email=None,
+                )
+            )
+        await session.commit()
+        return True, "ok"
+
+
+async def list_agent_invites(agent_tg_id: int, limit: int = 20) -> list[AgentInvite]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent or user.tenant_id is None:
+            return []
+        res = await session.execute(
+            select(AgentInvite)
+            .where(
+                AgentInvite.agent_user_id == user.id,
+                AgentInvite.tenant_id == user.tenant_id,
+            )
+            .order_by(AgentInvite.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def list_invited_client_user_ids(agent_tg_id: int) -> set[int]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent or user.tenant_id is None:
+            return set()
+        res = await session.execute(
+            select(AgentInvite.used_by_user_id)
+            .where(
+                AgentInvite.agent_user_id == user.id,
+                AgentInvite.tenant_id == user.tenant_id,
+                AgentInvite.used_by_user_id.is_not(None),
+            )
+        )
+        return {int(uid) for uid in res.scalars().all() if uid is not None}
 
 
 async def create_application_for_client(tg_id: int, description: str | None = None) -> Application:
@@ -63,7 +477,8 @@ async def create_application_for_client(tg_id: int, description: str | None = No
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         if user is None:
-            user = User(tg_id=tg_id, role=UserRole.client)
+            tenant = await _get_default_tenant(session)
+            user = User(tg_id=tg_id, role=UserRole.client, tenant_id=tenant.id)
             session.add(user)
             await session.flush()
 
@@ -74,24 +489,40 @@ async def create_application_for_client(tg_id: int, description: str | None = No
         return app
 
 
-async def list_incoming_applications(limit: int = 20) -> list[Application]:
+async def list_incoming_applications(agent_tg_id: int, limit: int = 20) -> list[Application]:
     async with get_session_maker()() as session:
+        res_u = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = res_u.scalar_one_or_none()
+        if agent is None:
+            return []
         res = await session.execute(
             select(Application)
             .options(selectinload(Application.client), selectinload(Application.quote))
-            .where(Application.status == ApplicationStatus.new)
+            .join(User, User.id == Application.client_user_id)
+            .where(
+                Application.status == ApplicationStatus.new,
+                User.tenant_id == agent.tenant_id,
+            )
             .order_by(Application.created_at.desc())
             .limit(limit)
         )
         return list(res.scalars().all())
 
 
-async def list_in_progress_applications(limit: int = 20) -> list[Application]:
+async def list_in_progress_applications(agent_tg_id: int, limit: int = 20) -> list[Application]:
     async with get_session_maker()() as session:
+        res_u = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = res_u.scalar_one_or_none()
+        if agent is None:
+            return []
         res = await session.execute(
             select(Application)
             .options(selectinload(Application.client), selectinload(Application.quote))
-            .where(Application.status == ApplicationStatus.in_progress)
+            .join(User, User.id == Application.client_user_id)
+            .where(
+                Application.status == ApplicationStatus.in_progress,
+                User.tenant_id == agent.tenant_id,
+            )
             .order_by(Application.created_at.desc())
             .limit(limit)
         )
@@ -108,7 +539,8 @@ async def create_kasko_quote(
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         if user is None:
-            user = User(tg_id=tg_id, role=UserRole.client)
+            tenant = await _get_default_tenant(session)
+            user = User(tg_id=tg_id, role=UserRole.client, tenant_id=tenant.id)
             session.add(user)
             await session.flush()
 
@@ -136,7 +568,8 @@ async def create_property_quote(
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         if user is None:
-            user = User(tg_id=tg_id, role=UserRole.client)
+            tenant = await _get_default_tenant(session)
+            user = User(tg_id=tg_id, role=UserRole.client, tenant_id=tenant.id)
             session.add(user)
             await session.flush()
 
@@ -165,7 +598,8 @@ async def create_generic_quote(
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         if user is None:
-            user = User(tg_id=tg_id, role=UserRole.client)
+            tenant = await _get_default_tenant(session)
+            user = User(tg_id=tg_id, role=UserRole.client, tenant_id=tenant.id)
             session.add(user)
             await session.flush()
 
@@ -188,7 +622,8 @@ async def create_application_from_quote(tg_id: int, quote_id: int) -> Applicatio
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         if user is None:
-            user = User(tg_id=tg_id, role=UserRole.client)
+            tenant = await _get_default_tenant(session)
+            user = User(tg_id=tg_id, role=UserRole.client, tenant_id=tenant.id)
             session.add(user)
             await session.flush()
 
@@ -240,9 +675,17 @@ async def create_application_from_quote(tg_id: int, quote_id: int) -> Applicatio
         return app
 
 
-async def set_application_status(app_id: int, status: ApplicationStatus) -> Application | None:
+async def set_application_status(agent_tg_id: int, app_id: int, status: ApplicationStatus) -> Application | None:
     async with get_session_maker()() as session:
-        res = await session.execute(select(Application).where(Application.id == app_id))
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return None
+        res = await session.execute(
+            select(Application)
+            .join(User, User.id == Application.client_user_id)
+            .where(Application.id == app_id, User.tenant_id == agent.tenant_id)
+        )
         app = res.scalar_one_or_none()
         if app is None:
             return None
@@ -252,9 +695,17 @@ async def set_application_status(app_id: int, status: ApplicationStatus) -> Appl
         return app
 
 
-async def delete_application(app_id: int) -> Application | None:
+async def delete_application(agent_tg_id: int, app_id: int) -> Application | None:
     async with get_session_maker()() as session:
-        res = await session.execute(select(Application).where(Application.id == app_id))
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return None
+        res = await session.execute(
+            select(Application)
+            .join(User, User.id == Application.client_user_id)
+            .where(Application.id == app_id, User.tenant_id == agent.tenant_id)
+        )
         app = res.scalar_one_or_none()
         if app is None:
             return None
@@ -269,7 +720,11 @@ async def create_application_note(agent_tg_id: int, app_id: int, text_value: str
         user = user_res.scalar_one_or_none()
         if user is None:
             return None
-        app_res = await session.execute(select(Application).where(Application.id == app_id))
+        app_res = await session.execute(
+            select(Application)
+            .join(User, User.id == Application.client_user_id)
+            .where(Application.id == app_id, User.tenant_id == user.tenant_id)
+        )
         app = app_res.scalar_one_or_none()
         if app is None or app.status != ApplicationStatus.in_progress:
             return None
@@ -286,7 +741,11 @@ async def list_notes_for_application(agent_tg_id: int, app_id: int, limit: int =
         user = user_res.scalar_one_or_none()
         if user is None:
             return []
-        app_res = await session.execute(select(Application).where(Application.id == app_id))
+        app_res = await session.execute(
+            select(Application)
+            .join(User, User.id == Application.client_user_id)
+            .where(Application.id == app_id, User.tenant_id == user.tenant_id)
+        )
         app = app_res.scalar_one_or_none()
         if app is None:
             return []
@@ -308,7 +767,12 @@ async def list_notes_for_agent(agent_tg_id: int, limit: int = 50) -> list[Applic
         res = await session.execute(
             select(ApplicationNote)
             .options(selectinload(ApplicationNote.application))
-            .where(ApplicationNote.agent_user_id == user.id)
+            .join(Application, Application.id == ApplicationNote.application_id)
+            .join(User, User.id == Application.client_user_id)
+            .where(
+                ApplicationNote.agent_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
             .order_by(ApplicationNote.created_at.desc())
             .limit(limit)
         )
@@ -324,7 +788,13 @@ async def get_note_for_agent(agent_tg_id: int, note_id: int) -> ApplicationNote 
         res = await session.execute(
             select(ApplicationNote)
             .options(selectinload(ApplicationNote.application))
-            .where(ApplicationNote.id == note_id, ApplicationNote.agent_user_id == user.id)
+            .join(Application, Application.id == ApplicationNote.application_id)
+            .join(User, User.id == Application.client_user_id)
+            .where(
+                ApplicationNote.id == note_id,
+                ApplicationNote.agent_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
         )
         return res.scalar_one_or_none()
 
@@ -336,9 +806,13 @@ async def delete_note_for_agent(agent_tg_id: int, note_id: int) -> bool:
         if user is None:
             return False
         res = await session.execute(
-            select(ApplicationNote).where(
+            select(ApplicationNote)
+            .join(Application, Application.id == ApplicationNote.application_id)
+            .join(User, User.id == Application.client_user_id)
+            .where(
                 ApplicationNote.id == note_id,
                 ApplicationNote.agent_user_id == user.id,
+                User.tenant_id == user.tenant_id,
             )
         )
         note = res.scalar_one_or_none()
@@ -478,9 +952,24 @@ async def create_reminder(
         res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
         user = res.scalar_one_or_none()
         if user is None:
-            user = User(tg_id=agent_tg_id, role=UserRole.agent)
+            tenant = await _get_default_tenant(session)
+            user = User(tg_id=agent_tg_id, role=UserRole.agent, tenant_id=tenant.id)
             session.add(user)
             await session.flush()
+
+        if note_id is not None:
+            note_res = await session.execute(
+                select(ApplicationNote)
+                .join(Application, Application.id == ApplicationNote.application_id)
+                .join(User, User.id == Application.client_user_id)
+                .where(
+                    ApplicationNote.id == note_id,
+                    ApplicationNote.agent_user_id == user.id,
+                    User.tenant_id == user.tenant_id,
+                )
+            )
+            if note_res.scalar_one_or_none() is None:
+                note_id = None
 
         r = Reminder(
             agent_user_id=user.id,
@@ -612,16 +1101,24 @@ async def create_client(
     full_name: str,
     phone: str | None,
     email: str | None,
+    source_user_id: int | None = None,
 ) -> Client:
     async with get_session_maker()() as session:
         res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
         agent = res.scalar_one_or_none()
         if agent is None:
-            agent = User(tg_id=agent_tg_id, role=UserRole.agent)
+            tenant = await _get_default_tenant(session)
+            agent = User(tg_id=agent_tg_id, role=UserRole.agent, tenant_id=tenant.id)
             session.add(agent)
             await session.flush()
 
-        c = Client(agent_user_id=agent.id, full_name=full_name, phone=phone, email=email)
+        c = Client(
+            agent_user_id=agent.id,
+            source_user_id=source_user_id,
+            full_name=full_name,
+            phone=phone,
+            email=email,
+        )
         session.add(c)
         await session.commit()
         await session.refresh(c)
@@ -638,6 +1135,7 @@ async def list_clients_page(
     *,
     limit: int = 20,
     offset: int = 0,
+    invited_only: bool = False,
 ) -> list[Client]:
     async with get_session_maker()() as session:
         res_u = await session.execute(select(User).where(User.tg_id == agent_tg_id))
@@ -645,7 +1143,11 @@ async def list_clients_page(
         if agent is None:
             return []
 
-        stmt = select(Client).where(Client.agent_user_id == agent.id)
+        stmt = (
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, User.tenant_id == agent.tenant_id)
+        )
         if query:
             q = f"%{query.strip()}%"
             # ILIKE works in PostgreSQL; for other DBs this may behave differently.
@@ -656,6 +1158,8 @@ async def list_clients_page(
                     Client.email.ilike(q),
                 )
             )
+        if invited_only:
+            stmt = stmt.where(Client.source_user_id.is_not(None))
 
         stmt = stmt.order_by(Client.created_at.desc()).offset(offset).limit(limit)
         res = await session.execute(stmt)
@@ -670,7 +1174,9 @@ async def get_client(agent_tg_id: int, client_id: int) -> Client | None:
             return None
 
         res = await session.execute(
-            select(Client).where(Client.agent_user_id == agent.id, Client.id == client_id)
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Client.id == client_id, User.tenant_id == agent.tenant_id)
         )
         return res.scalar_one_or_none()
 
@@ -689,7 +1195,9 @@ async def update_client(
             return None
 
         res = await session.execute(
-            select(Client).where(Client.agent_user_id == agent.id, Client.id == client_id)
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Client.id == client_id, User.tenant_id == agent.tenant_id)
         )
         c = res.scalar_one_or_none()
         if c is None:
@@ -725,7 +1233,11 @@ async def create_contract_for_client(
         if agent is None:
             return None
 
-        res_c = await session.execute(select(Client).where(Client.agent_user_id == agent.id, Client.id == client_id))
+        res_c = await session.execute(
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Client.id == client_id, User.tenant_id == agent.tenant_id)
+        )
         c = res_c.scalar_one_or_none()
         if c is None:
             return None
@@ -781,7 +1293,8 @@ async def list_contracts_for_client(agent_tg_id: int, client_id: int, limit: int
         res = await session.execute(
             select(Contract)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, Contract.client_id == client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Contract.client_id == client_id, User.tenant_id == agent.tenant_id)
             .order_by(Contract.created_at.desc())
             .limit(limit)
         )
@@ -799,7 +1312,8 @@ async def get_contract_detailed(agent_tg_id: int, contract_id: int) -> Contract 
             select(Contract)
             .options(selectinload(Contract.payments))
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, Contract.id == contract_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Contract.id == contract_id, User.tenant_id == agent.tenant_id)
         )
         contract = res.scalar_one_or_none()
         if contract is None:
@@ -821,7 +1335,8 @@ async def search_contracts_by_number(agent_tg_id: int, query: str, limit: int = 
         res = await session.execute(
             select(Contract)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, Contract.contract_number.ilike(q))
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Contract.contract_number.ilike(q), User.tenant_id == agent.tenant_id)
             .order_by(Contract.created_at.desc())
             .limit(limit)
         )
@@ -834,6 +1349,10 @@ async def mark_payment_paid(agent_tg_id: int, payment_id: int) -> int | None:
     Returns contract_id on success.
     """
     async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return None
         res = await session.execute(
             select(Payment)
             .join(Contract, Contract.id == Payment.contract_id)
@@ -841,6 +1360,7 @@ async def mark_payment_paid(agent_tg_id: int, payment_id: int) -> int | None:
             .join(User, User.id == Client.agent_user_id)
             .where(
                 User.tg_id == agent_tg_id,
+                User.tenant_id == agent.tenant_id,
                 Payment.id == payment_id,
                 Payment.status == PaymentStatus.pending,
                 Contract.status == ContractStatus.active,
@@ -881,7 +1401,8 @@ async def update_contract_for_client(
         contract_res = await session.execute(
             select(Contract)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, Contract.id == contract_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Contract.id == contract_id, User.tenant_id == agent.tenant_id)
         )
         contract = contract_res.scalar_one_or_none()
         if contract is None:
@@ -931,9 +1452,10 @@ async def terminate_contract(agent_tg_id: int, contract_id: int) -> bool:
             return False
 
         contract_res = await session.execute(
-            select(Contract).join(Client, Client.id == Contract.client_id).where(
+            select(Contract).join(Client, Client.id == Contract.client_id).join(User, User.id == Client.agent_user_id).where(
                 Client.agent_user_id == agent.id,
                 Contract.id == contract_id,
+                User.tenant_id == agent.tenant_id,
             )
         )
         contract = contract_res.scalar_one_or_none()
@@ -958,7 +1480,11 @@ async def create_client_document(
         if agent is None:
             return None
 
-        res_c = await session.execute(select(Client).where(Client.agent_user_id == agent.id, Client.id == client_id))
+        res_c = await session.execute(
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Client.id == client_id, User.tenant_id == agent.tenant_id)
+        )
         c = res_c.scalar_one_or_none()
         if c is None:
             return None
@@ -989,7 +1515,8 @@ async def list_client_documents(
         res = await session.execute(
             select(ClientDocument)
             .join(Client, Client.id == ClientDocument.client_id)
-            .where(Client.agent_user_id == agent.id, ClientDocument.client_id == client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, ClientDocument.client_id == client_id, User.tenant_id == agent.tenant_id)
             .order_by(ClientDocument.created_at.desc())
             .limit(limit)
         )
@@ -1006,7 +1533,8 @@ async def get_client_document(agent_tg_id: int, doc_id: int) -> ClientDocument |
         res = await session.execute(
             select(ClientDocument)
             .join(Client, Client.id == ClientDocument.client_id)
-            .where(Client.agent_user_id == agent.id, ClientDocument.id == doc_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, ClientDocument.id == doc_id, User.tenant_id == agent.tenant_id)
         )
         return res.scalar_one_or_none()
 
@@ -1027,7 +1555,8 @@ async def create_contract_document(
         res_c = await session.execute(
             select(Contract)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, Contract.id == contract_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Contract.id == contract_id, User.tenant_id == agent.tenant_id)
         )
         contract = res_c.scalar_one_or_none()
         if contract is None:
@@ -1060,7 +1589,8 @@ async def list_contract_documents(
             select(ContractDocument)
             .join(Contract, Contract.id == ContractDocument.contract_id)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, ContractDocument.contract_id == contract_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, ContractDocument.contract_id == contract_id, User.tenant_id == agent.tenant_id)
             .order_by(ContractDocument.created_at.desc())
             .limit(limit)
         )
@@ -1078,7 +1608,8 @@ async def get_contract_document(agent_tg_id: int, doc_id: int) -> ContractDocume
             select(ContractDocument)
             .join(Contract, Contract.id == ContractDocument.contract_id)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, ContractDocument.id == doc_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, ContractDocument.id == doc_id, User.tenant_id == agent.tenant_id)
         )
         return res.scalar_one_or_none()
 
@@ -1094,9 +1625,11 @@ async def contract_has_documents(agent_tg_id: int, contract_id: int) -> bool:
             select(ContractDocument.id)
             .join(Contract, Contract.id == ContractDocument.contract_id)
             .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
             .where(
                 Client.agent_user_id == agent.id,
                 ContractDocument.contract_id == contract_id,
+                User.tenant_id == agent.tenant_id,
             )
             .limit(1)
         )
@@ -1113,7 +1646,8 @@ async def delete_client_document(agent_tg_id: int, doc_id: int) -> bool:
         res = await session.execute(
             select(ClientDocument)
             .join(Client, Client.id == ClientDocument.client_id)
-            .where(Client.agent_user_id == agent.id, ClientDocument.id == doc_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, ClientDocument.id == doc_id, User.tenant_id == agent.tenant_id)
         )
         doc = res.scalar_one_or_none()
         if doc is None:
@@ -1134,7 +1668,8 @@ async def delete_contract_document(agent_tg_id: int, doc_id: int) -> bool:
             select(ContractDocument)
             .join(Contract, Contract.id == ContractDocument.contract_id)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, ContractDocument.id == doc_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, ContractDocument.id == doc_id, User.tenant_id == agent.tenant_id)
         )
         doc = res.scalar_one_or_none()
         if doc is None:
@@ -1154,7 +1689,8 @@ async def delete_contract(agent_tg_id: int, contract_id: int) -> bool:
         res = await session.execute(
             select(Contract)
             .join(Client, Client.id == Contract.client_id)
-            .where(Client.agent_user_id == agent.id, Contract.id == contract_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Contract.id == contract_id, User.tenant_id == agent.tenant_id)
         )
         contract = res.scalar_one_or_none()
         if contract is None:
@@ -1173,7 +1709,8 @@ async def delete_client(agent_tg_id: int, client_id: int) -> bool:
 
         res = await session.execute(
             select(Client)
-            .where(Client.agent_user_id == agent.id, Client.id == client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(Client.agent_user_id == agent.id, Client.id == client_id, User.tenant_id == agent.tenant_id)
         )
         client = res.scalar_one_or_none()
         if client is None:
