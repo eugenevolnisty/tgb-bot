@@ -181,8 +181,11 @@ async def main(count: int, per_agent: bool, seed: int | None) -> None:
                 start_date=g.start_date,
                 end_date=g.end_date,
                 total_amount_minor=g.total_amount_minor,
+                insured_sum_minor=g.total_amount_minor * random.randint(50, 300),
                 currency=g.currency,
-                payments=g.payments,
+                initial_payment_amount_minor=g.payments[0][0] if g.payments else 1000,
+                initial_payment_due_date=g.start_date,
+                payments=g.payments[1:] if len(g.payments) > 1 else [],
                 vehicle_description=g.vehicle_description,
             )
 
@@ -235,8 +238,11 @@ async def _seed_for_agent(agent_tg_id: int, count: int, seed: int | None) -> Non
                 start_date=g.start_date,
                 end_date=g.end_date,
                 total_amount_minor=g.total_amount_minor,
+                insured_sum_minor=g.total_amount_minor * random.randint(50, 300),
                 currency=g.currency,
-                payments=g.payments,
+                initial_payment_amount_minor=g.payments[0][0] if g.payments else 1000,
+                initial_payment_due_date=g.start_date,
+                payments=g.payments[1:] if len(g.payments) > 1 else [],
                 vehicle_description=g.vehicle_description,
             )
             created_clients += 1

@@ -1,5 +1,6 @@
 from aiogram import F, Router
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot.db.models import UserRole
@@ -7,6 +8,17 @@ from bot.db.repo import get_or_create_user, set_user_role
 from bot.keyboards import Btn, agent_menu, client_menu, role_keyboard
 
 router = Router()
+
+
+async def _delete_user_button_message(message: Message) -> None:
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def _set_reply_keyboard_silent(message: Message, *, text: str, reply_markup) -> None:
+    await message.answer(text, reply_markup=reply_markup)
 
 
 @router.message(CommandStart())
@@ -47,3 +59,18 @@ async def switch_role(message: Message) -> None:
         return
     await set_user_role(message.from_user.id, UserRole.agent)
     await message.answer("Переключил роль: агент.", reply_markup=agent_menu())
+
+
+@router.message(F.text == Btn.MAIN_MENU)
+async def to_main_menu(message: Message, state: FSMContext) -> None:
+    await _delete_user_button_message(message)
+    if await state.get_state() is not None:
+        await state.clear()
+    user = await get_or_create_user(message.from_user.id)
+    if user.role == UserRole.agent:
+        await _set_reply_keyboard_silent(message, text="Выберите действие.", reply_markup=agent_menu())
+        return
+    if user.role == UserRole.client:
+        await _set_reply_keyboard_silent(message, text="Выберите действие.", reply_markup=client_menu())
+        return
+    await message.answer("Здравствуйте! Кто вы?", reply_markup=role_keyboard())

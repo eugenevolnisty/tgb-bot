@@ -31,6 +31,7 @@ class User(Base):
     quotes: Mapped[list["Quote"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     reminders: Mapped[list["Reminder"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     clients: Mapped[list["Client"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
+    commissions: Mapped[list["AgentCommission"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
 
 
 class ApplicationStatus(str, enum.Enum):
@@ -57,6 +58,7 @@ class Application(Base):
     client: Mapped["User"] = relationship(back_populates="applications")
     quote_id: Mapped[int | None] = mapped_column(ForeignKey("quotes.id", ondelete="SET NULL"), index=True, nullable=True)
     quote: Mapped["Quote"] = relationship(back_populates="application")
+    notes: Mapped[list["ApplicationNote"]] = relationship(back_populates="application", cascade="all, delete-orphan")
 
 
 class QuoteType(str, enum.Enum):
@@ -119,8 +121,43 @@ class Reminder(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    note_id: Mapped[int | None] = mapped_column(ForeignKey("application_notes.id", ondelete="SET NULL"), index=True, nullable=True)
 
     agent: Mapped["User"] = relationship(back_populates="reminders")
+    note: Mapped["ApplicationNote | None"] = relationship(back_populates="reminders")
+
+
+class ApplicationNote(Base):
+    __tablename__ = "application_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(ForeignKey("applications.id", ondelete="CASCADE"), index=True, nullable=False)
+    agent_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    application: Mapped["Application"] = relationship(back_populates="notes")
+    agent: Mapped["User"] = relationship()
+    reminders: Mapped[list["Reminder"]] = relationship(back_populates="note")
+
+
+class AgentCommission(Base):
+    __tablename__ = "agent_commissions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    company: Mapped[str] = mapped_column(String(200), nullable=False)
+    contract_kind: Mapped[str] = mapped_column(String(200), nullable=False)
+    percent_bp: Mapped[int] = mapped_column(Integer, nullable=False)  # basis points: 12.5% -> 1250
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    agent: Mapped["User"] = relationship(back_populates="commissions")
 
 
 class Client(Base):
@@ -139,6 +176,10 @@ class Client(Base):
     contracts: Mapped[list["Contract"]] = relationship(back_populates="client", cascade="all, delete-orphan")
     documents: Mapped[list["ClientDocument"]] = relationship(back_populates="client", cascade="all, delete-orphan")
 
+class ContractStatus(str, enum.Enum):
+    active = "active"
+    terminated = "terminated"
+
 
 class Contract(Base):
     __tablename__ = "contracts"
@@ -154,7 +195,18 @@ class Contract(Base):
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
 
-    total_amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)  # BYN * 100
+    # Действует/прекращен — важно для дальнейшей логики оплаты/комиссий.
+    status: Mapped["ContractStatus"] = mapped_column(
+        Enum(ContractStatus, name="contract_status"),
+        default=ContractStatus.active,
+        nullable=False,
+        index=True,
+    )
+
+    # Annual insurance premium (used for payment schedule).
+    total_amount_minor: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Insured sum / coverage amount.
+    insured_sum_minor: Mapped[int | None] = mapped_column(Integer, nullable=True)
     currency: Mapped[str] = mapped_column(String(8), default="BYN", nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -43,8 +43,13 @@ async def reminders_worker(bot: Bot, poll_interval_seconds: int = 30) -> None:
                         [
                             InlineKeyboardButton(text="⏱ +1 час", callback_data=f"rem:snooze:{reminder.id}:60"),
                             InlineKeyboardButton(text="📝 Другое", callback_data=f"rem:snooze_other:{reminder.id}"),
-                            InlineKeyboardButton(text="🔕 Отменить", callback_data=f"rem:cancel:{reminder.id}"),
+                            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rem:cancel:{reminder.id}"),
                         ],
+                        *(
+                            [[InlineKeyboardButton(text="🗒 К заметке", callback_data=f"rem:note:{reminder.note_id}")]]
+                            if getattr(reminder, "note_id", None) is not None
+                            else []
+                        ),
                     ]
                 )
                 await bot.send_message(agent_tg_id, text, reply_markup=kb)

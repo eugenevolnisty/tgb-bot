@@ -3,11 +3,11 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, Message
 
 from bot.db.models import UserRole
 from bot.db.repo import create_application_for_client, get_or_create_user
-from bot.keyboards import Btn, client_menu, insurance_type_keyboard
+from bot.keyboards import Btn, client_menu, insurance_type_keyboard, to_main_menu_keyboard
 
 router = Router()
 
@@ -98,7 +98,7 @@ async def pick_insurance_type(callback: CallbackQuery, state: FSMContext) -> Non
         await state.set_state(AppForm.subject)
         await callback.message.answer(
             "3) Введите, что вы хотите застраховать (текстом). Можно “отмена”.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=to_main_menu_keyboard(),
         )
     await callback.answer()
 

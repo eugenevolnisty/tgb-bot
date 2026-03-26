@@ -17,10 +17,13 @@ class Btn:
     INCOMING = "📥 Входящие заявки"
     IN_PROGRESS = "🛠 Заявки в работе"
     MY_CLIENTS = "👥 Мои клиенты"
+    DASHBOARD = "📈 Дашборд"
     REMINDERS = "⏰ Напоминания"
     REPORTS = "📊 Отчёты"
     SETTINGS = "⚙️ Настройки"
+    ADD_PAYMENT = "💰 Внести взнос"
     SWITCH_TO_CLIENT = "🔁 Переключиться на клиента"
+    MAIN_MENU = "🏠 Вернуться в главное меню"
 
 
 def role_keyboard() -> InlineKeyboardMarkup:
@@ -51,13 +54,23 @@ def agent_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=Btn.INCOMING), KeyboardButton(text=Btn.IN_PROGRESS)],
+            [KeyboardButton(text=Btn.DASHBOARD)],
             [KeyboardButton(text=Btn.MY_CLIENTS)],
+            [KeyboardButton(text=Btn.ADD_PAYMENT)],
             [KeyboardButton(text=Btn.REMINDERS), KeyboardButton(text=Btn.REPORTS)],
             [KeyboardButton(text=Btn.SETTINGS)],
             [KeyboardButton(text=Btn.SWITCH_TO_CLIENT)],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
+    )
+
+
+def to_main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=Btn.MAIN_MENU)]],
+        resize_keyboard=True,
+        input_field_placeholder="Сценарий",
     )
 
 
@@ -69,12 +82,18 @@ def apply_quote_keyboard(quote_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def application_actions_keyboard(app_id: int) -> InlineKeyboardMarkup:
+def application_actions_keyboard(app_id: int, *, in_progress: bool = False, has_notes: bool = False) -> InlineKeyboardMarkup:
+    if in_progress:
+        rows = [[InlineKeyboardButton(text="🗑 Удалить", callback_data=f"app:delete:{app_id}")]]
+        rows.append([InlineKeyboardButton(text="➕ Добавить заметку", callback_data=f"app:note:add:{app_id}")])
+        note_text = "📒 Заметки" if not has_notes else "📒 Заметки (есть)"
+        rows.append([InlineKeyboardButton(text=note_text, callback_data=f"app:note:list:{app_id}")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"app_status:{app_id}:in_progress"),
-                InlineKeyboardButton(text="🏁 Закрыть", callback_data=f"app_status:{app_id}:done"),
+                InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"app:take:{app_id}"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"app:delete:{app_id}"),
             ]
         ]
     )

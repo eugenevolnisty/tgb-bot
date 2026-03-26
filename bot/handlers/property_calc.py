@@ -3,11 +3,11 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message
 
 from bot.db.models import UserRole
 from bot.db.repo import create_property_quote, get_or_create_user
-from bot.keyboards import apply_quote_keyboard, client_menu
+from bot.keyboards import apply_quote_keyboard, client_menu, to_main_menu_keyboard
 from bot.services.property import PropertyInput, calculate_property
 
 router = Router()
@@ -86,7 +86,7 @@ async def step_value(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(value=value)
     await state.set_state(PropertyCalc.comment)
-    await message.answer("Комментарий (можно “нет”).", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Комментарий (можно “нет”).", reply_markup=to_main_menu_keyboard())
 
 
 @router.message(PropertyCalc.comment)
@@ -137,5 +137,5 @@ async def step_comment(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Меню.", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu())
 

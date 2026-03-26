@@ -10,6 +10,8 @@ from bot.handlers.generic_calcs import router as generic_router
 from bot.handlers.reminders import router as reminders_router
 from bot.handlers.clients import router as clients_router
 from bot.handlers.payment_reports import router as payment_reports_router
+from bot.handlers.contract_reports import router as contract_reports_router
+from bot.handlers.commission_reports import router as commission_reports_router
 
 router = Router()
 router.include_router(start_router)
@@ -22,4 +24,6 @@ router.include_router(generic_router)
 router.include_router(reminders_router)
 router.include_router(clients_router)
 router.include_router(payment_reports_router)
+router.include_router(contract_reports_router)
+router.include_router(commission_reports_router)
 

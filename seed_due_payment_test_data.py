@@ -116,6 +116,8 @@ async def main(agent_tg_id: int, per_client_contracts: int, seed: int | None) ->
         part1_a = random.randint(30_000, total_a - 30_000)
         part7_a = total_a - part1_a
         payments_a = [(part1_a, due_dates[0]), (part7_a, due_dates[2])]
+        initial_a = max(5_000, total_a // 10)
+        total_a_with_initial = total_a + initial_a
 
         vehicle_desc_a = random.choice(_CARS) if kind_a == "КАСКО" else None
         await create_contract_for_client(
@@ -126,8 +128,11 @@ async def main(agent_tg_id: int, per_client_contracts: int, seed: int | None) ->
             contract_kind=kind_a,
             start_date=start_date,
             end_date=end_date,
-            total_amount_minor=total_a,
+            total_amount_minor=total_a_with_initial,
+            insured_sum_minor=total_a_with_initial * random.randint(50, 300),
             currency=currency_a,
+            initial_payment_amount_minor=initial_a,
+            initial_payment_due_date=start_date,
             payments=payments_a,
             vehicle_description=vehicle_desc_a,
         )
@@ -137,6 +142,8 @@ async def main(agent_tg_id: int, per_client_contracts: int, seed: int | None) ->
         part3_b = random.randint(40_000, total_b - 40_000)
         part7_b = total_b - part3_b
         payments_b = [(part3_b, due_dates[1]), (part7_b, due_dates[2])]
+        initial_b = max(5_000, total_b // 10)
+        total_b_with_initial = total_b + initial_b
 
         vehicle_desc_b = random.choice(_CARS) if kind_b == "КАСКО" else None
         await create_contract_for_client(
@@ -147,8 +154,11 @@ async def main(agent_tg_id: int, per_client_contracts: int, seed: int | None) ->
             contract_kind=kind_b,
             start_date=start_date,
             end_date=end_date,
-            total_amount_minor=total_b,
+            total_amount_minor=total_b_with_initial,
+            insured_sum_minor=total_b_with_initial * random.randint(50, 300),
             currency=currency_b,
+            initial_payment_amount_minor=initial_b,
+            initial_payment_due_date=start_date,
             payments=payments_b,
             vehicle_description=vehicle_desc_b,
         )
@@ -166,6 +176,8 @@ async def main(agent_tg_id: int, per_client_contracts: int, seed: int | None) ->
                 payments_x = [(p1, min(chosen)), (p2, max(chosen))]
 
                 vehicle_desc_x = random.choice(_CARS) if kind_x == "КАСКО" else None
+                initial_x = max(5_000, total_x // 10)
+                total_x_with_initial = total_x + initial_x
 
                 await create_contract_for_client(
                     agent_tg_id=agent_tg_id,
@@ -175,8 +187,11 @@ async def main(agent_tg_id: int, per_client_contracts: int, seed: int | None) ->
                     contract_kind=kind_x,
                     start_date=start_date,
                     end_date=end_date,
-                    total_amount_minor=total_x,
+                    total_amount_minor=total_x_with_initial,
+                    insured_sum_minor=total_x_with_initial * random.randint(50, 300),
                     currency=currency_x,
+                    initial_payment_amount_minor=initial_x,
+                    initial_payment_due_date=start_date,
                     payments=payments_x,
                     vehicle_description=vehicle_desc_x,
                 )

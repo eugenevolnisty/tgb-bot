@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from datetime import date
+import calendar
+from datetime import date, timedelta
 
 from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot.db.models import Client, PaymentStatus, UserRole
+from bot.db.models import Client, ContractStatus, PaymentStatus, UserRole
 from bot.db.repo import (
     create_client,
     create_client_document,
@@ -27,10 +29,13 @@ from bot.db.repo import (
     list_client_documents,
     list_contract_documents,
     contract_has_documents,
+    terminate_contract,
+    search_contracts_by_number,
+    mark_payment_paid,
     update_client,
     update_contract_for_client,
 )
-from bot.keyboards import agent_menu
+from bot.keyboards import Btn, agent_menu, to_main_menu_keyboard
 from bot.services.datetime_parse import parse_date_ru
 
 router = Router()
@@ -47,6 +52,44 @@ _CLIENT_DOC_CARD_MSG: dict[tuple[int, int], tuple[int, int]] = {}
 
 _CONTRACT_DOC_CARD_MSG: dict[tuple[int, int], tuple[int, int]] = {}
 # (agent_tg_id, doc_id) -> (contract_id, card_message_id)
+
+# Rolling-clean storage for transient flow prompts.
+_FLOW_LAST_PROMPT_MSG: dict[tuple[int, str], int] = {}
+
+
+async def _clear_flow_prompt(message: Message, flow_key: str) -> None:
+    key = (message.chat.id, flow_key)
+    msg_id = _FLOW_LAST_PROMPT_MSG.pop(key, None)
+    if msg_id is None:
+        return
+    try:
+        await message.bot.delete_message(chat_id=message.chat.id, message_id=msg_id)
+    except Exception:
+        pass
+
+
+async def _flow_answer(message: Message, flow_key: str, text: str, **kwargs) -> Message:
+    await _clear_flow_prompt(message, flow_key)
+    sent = await message.answer(text, **kwargs)
+    _FLOW_LAST_PROMPT_MSG[(message.chat.id, flow_key)] = sent.message_id
+    return sent
+
+
+async def _delete_user_button_message(message: Message) -> None:
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def _set_reply_keyboard_silent_message(message: Message, *, text: str, reply_markup) -> None:
+    await message.answer(text, reply_markup=reply_markup)
+
+
+async def _set_reply_keyboard_silent_callback(callback: CallbackQuery, *, text: str, reply_markup) -> None:
+    if callback.message is None:
+        return
+    await callback.message.answer(text, reply_markup=reply_markup)
 
 
 async def _ensure_agent(message: Message) -> bool:
@@ -79,6 +122,7 @@ def clients_menu_keyboard() -> "aiogram.types.ReplyKeyboardMarkup":
             [KeyboardButton(text=ClientsMenu.ADD)],
             [KeyboardButton(text=ClientsMenu.SEARCH)],
             [KeyboardButton(text=ClientsMenu.BACK)],
+            [KeyboardButton(text=Btn.MAIN_MENU)],
         ],
         resize_keyboard=True,
         input_field_placeholder="Клиенты",
@@ -229,10 +273,8 @@ async def _send_client_card(
     await message.answer("\n".join(lines), reply_markup=kb)
 
 
-@router.message(F.text.regexp(r"^\d+$"))
+@router.message(StateFilter(None), F.text.regexp(r"^\d+$"))
 async def choose_client_by_index(message: Message, state: FSMContext) -> None:
-    if await state.get_state() is not None:
-        return
     if not await _ensure_agent(message):
         return
     ids = _LAST_CLIENTS_BY_AGENT.get(message.from_user.id)
@@ -240,7 +282,7 @@ async def choose_client_by_index(message: Message, state: FSMContext) -> None:
         return
     idx = int((message.text or "").strip()) - 1
     if idx < 0 or idx >= len(ids):
-        await message.answer("Неверный номер. Введи номер из списка клиентов.", reply_markup=clients_menu_keyboard())
+        # Ignore unrelated numeric messages (e.g. contract numbers in other flows).
         return
     await _send_client_card(agent_tg_id=message.from_user.id, client_id=ids[idx], message=message)
 
@@ -250,7 +292,126 @@ async def clients_back(message: Message, state: FSMContext) -> None:
     if await state.get_state() is not None:
         await state.clear()
     _LAST_CLIENTS_BY_AGENT.pop(message.from_user.id, None)
-    await message.answer("Меню.", reply_markup=agent_menu())
+    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
+
+
+class PaymentInsert(StatesGroup):
+    search_contract = State()
+    search_client = State()
+
+
+@router.message(F.text == Btn.ADD_PAYMENT)
+async def agent_add_payment_start(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    await _delete_user_button_message(message)
+    await state.clear()
+    await _flow_answer(
+        message,
+        "payment_insert",
+        "Внести взнос. Как ищем?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Найти договор", callback_data="payins:search_contract")],
+                [InlineKeyboardButton(text="Найти клиента", callback_data="payins:search_client")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="payins:back")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data == "payins:back")
+async def agent_add_payment_back(callback: CallbackQuery, state: FSMContext) -> None:
+    if await state.get_state() is not None:
+        await state.clear()
+    await _clear_flow_prompt(callback.message, "payment_insert")
+    await _set_reply_keyboard_silent_callback(callback, text="Выберите действие.", reply_markup=agent_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "payins:search_contract")
+async def agent_add_payment_search_contract(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(PaymentInsert.search_contract)
+    await _flow_answer(callback.message, "payment_insert", "Введите номер договора:", reply_markup=to_main_menu_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "payins:search_client")
+async def agent_add_payment_search_client(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(PaymentInsert.search_client)
+    await _flow_answer(
+        callback.message,
+        "payment_insert",
+        "Введите текст для поиска клиента (имя/телефон/email):",
+        reply_markup=to_main_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(PaymentInsert.search_contract)
+async def agent_add_payment_search_contract_query(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    query = (message.text or "").strip()
+    if len(query) < 1:
+        await _flow_answer(message, "payment_insert", "Введите номер договора.")
+        return
+    contracts = await search_contracts_by_number(message.from_user.id, query, limit=10)
+    await state.clear()
+    await _clear_flow_prompt(message, "payment_insert")
+    if not contracts:
+        await message.answer("По этому номеру договор не найден.", reply_markup=agent_menu())
+        return
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for ct in contracts:
+        row.append(InlineKeyboardButton(text=f"#{ct.contract_number} (ID {ct.id})", callback_data=f"client:view_contract:{ct.id}"))
+        if len(row) >= 2:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+
+    await message.answer("Найденные договоры:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
+
+
+@router.message(PaymentInsert.search_client)
+async def agent_add_payment_search_client_query(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    query = (message.text or "").strip()
+    if len(query) < 2:
+        await _flow_answer(message, "payment_insert", "Введите минимум 2 символа для поиска.")
+        return
+    items = await list_clients(message.from_user.id, query=query, limit=10)
+    await state.clear()
+    await _clear_flow_prompt(message, "payment_insert")
+    if not items:
+        await message.answer("По этому запросу клиенты не найдены.", reply_markup=agent_menu())
+        return
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for c in items:
+        row.append(InlineKeyboardButton(text=f"{c.full_name} (ID {c.id})", callback_data=f"client:open:{c.id}"))
+        if len(row) >= 1:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+
+    await message.answer("Найденные клиенты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
 
 
 class ClientAdd(StatesGroup):
@@ -278,9 +439,14 @@ class ContractAdd(StatesGroup):
     contract_kind_other = State()
     currency = State()
     vehicle = State()
+    signing_date = State()
     start_date = State()
     end_date = State()
     total_amount = State()
+    insured_sum = State()
+    payment_plan = State()
+    initial_payment_amount = State()
+    auto_plan_confirm = State()
     payments_count = State()
     payment_amount = State()
     payment_due_date = State()
@@ -300,7 +466,7 @@ async def start_add_client(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await state.set_state(ClientAdd.name)
-    await message.answer("Имя клиента?", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Имя клиента?", reply_markup=to_main_menu_keyboard())
 
 
 @router.message(F.text == ClientsMenu.SEARCH)
@@ -309,7 +475,7 @@ async def start_search_clients(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await state.set_state(ClientsSearch.query)
-    await message.answer("Введите текст для поиска (имя / телефон / email):", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Введите текст для поиска (имя / телефон / email):", reply_markup=to_main_menu_keyboard())
 
 
 @router.message(ClientsSearch.query)
@@ -522,7 +688,7 @@ async def start_edit_client(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ClientEdit.name)
     await callback.message.answer(
         f"Новые имя клиента? Текущее: {c.full_name}\nМожно написать новое или 'оставить'.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=to_main_menu_keyboard(),
     )
     await callback.answer()
 
@@ -612,7 +778,12 @@ async def start_add_contract(callback: CallbackQuery, state: FSMContext) -> None
     await state.clear()
     await state.update_data(contract_add_client_id=client_id, contract_edit_id=None, payments=[])
     await state.set_state(ContractAdd.contract_number)
-    await callback.message.answer("Номер договора (например: 1-2026)?", reply_markup=ReplyKeyboardRemove())
+    await _flow_answer(
+        callback.message,
+        "contract_add",
+        "Номер договора (любой формат, например: 1-2026 или 20262602):",
+        reply_markup=to_main_menu_keyboard(),
+    )
     await callback.answer()
 
 
@@ -642,7 +813,12 @@ async def start_edit_contract(callback: CallbackQuery, state: FSMContext) -> Non
         payments=[],
     )
     await state.set_state(ContractAdd.contract_number)
-    await callback.message.answer(f"Номер договора? Текущее: {contract.contract_number}\nНапишите новое.", reply_markup=ReplyKeyboardRemove())
+    await _flow_answer(
+        callback.message,
+        "contract_add",
+        f"Номер договора? Текущее: {contract.contract_number}\nНапишите новое.",
+        reply_markup=to_main_menu_keyboard(),
+    )
     await callback.answer()
 
 
@@ -650,13 +826,15 @@ async def start_edit_contract(callback: CallbackQuery, state: FSMContext) -> Non
 async def contract_step_number(message: Message, state: FSMContext) -> None:
     if not await _ensure_agent(message):
         return
-    txt = (message.text or "").strip()
+    raw = message.text or ""
+    txt = raw.strip()
     if len(txt) < 1:
-        await message.answer("Введите номер договора.")
+        await _flow_answer(message, "contract_add", "Введите номер договора.")
         return
-    await state.update_data(contract_number=txt)
+    # Keep user input as-is (except newline trimming for transport).
+    await state.update_data(contract_number=raw.strip("\r\n"))
     await state.set_state(ContractAdd.company)
-    await message.answer("Компания страхователя/компания-партнёр? (текст)")
+    await _flow_answer(message, "contract_add", "Страховая компания по договору? (например: Белгосстрах)")
 
 
 @router.message(ContractAdd.company)
@@ -665,7 +843,7 @@ async def contract_step_company(message: Message, state: FSMContext) -> None:
         return
     txt = (message.text or "").strip()
     if len(txt) < 2:
-        await message.answer("Введите компанию (минимум 2 символа).")
+        await _flow_answer(message, "contract_add", "Введите компанию (минимум 2 символа).")
         return
     await state.update_data(contract_company=txt)
     await state.set_state(ContractAdd.contract_kind)
@@ -689,7 +867,7 @@ async def contract_step_company(message: Message, state: FSMContext) -> None:
             ],
         ]
     )
-    await message.answer("Выбери вид договора:", reply_markup=kb)
+    await _flow_answer(message, "contract_add", "Выбери вид договора:", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("client:contract_kind:"))
@@ -720,7 +898,7 @@ async def contract_kind_pick(callback: CallbackQuery, state: FSMContext) -> None
     await state.update_data(contract_kind=label, contract_kind_key=key)
     if key == "other":
         await state.set_state(ContractAdd.contract_kind_other)
-        await callback.message.answer("Укажи конкретный вид договора (текстом).")
+        await _flow_answer(callback.message, "contract_add", "Укажи конкретный вид договора (текстом).")
         await callback.answer()
         return
 
@@ -740,7 +918,7 @@ async def contract_kind_pick(callback: CallbackQuery, state: FSMContext) -> None
             ],
         ]
     )
-    await callback.message.answer("Выбери валюту договорa:", reply_markup=kb)
+    await _flow_answer(callback.message, "contract_add", "Выбери валюту договорa:", reply_markup=kb)
     await callback.answer()
 
 
@@ -750,7 +928,7 @@ async def contract_step_kind_other(message: Message, state: FSMContext) -> None:
         return
     txt = (message.text or "").strip()
     if len(txt) < 2:
-        await message.answer("Введите вид чуть подробнее.")
+        await _flow_answer(message, "contract_add", "Введите вид чуть подробнее.")
         return
     await state.update_data(contract_kind=f"Другой: {txt}")
     await state.set_state(ContractAdd.currency)
@@ -767,7 +945,7 @@ async def contract_step_kind_other(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="CNY", callback_data="client:contract_currency:CNY")],
         ]
     )
-    await message.answer("Выбери валюту договора:", reply_markup=kb)
+    await _flow_answer(message, "contract_add", "Выбери валюту договора:", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("client:contract_currency:"))
@@ -784,16 +962,33 @@ async def contract_currency_pick(callback: CallbackQuery, state: FSMContext) -> 
     kind_key = str(data.get("contract_kind_key") or "")
     if kind_key == "kasko":
         await state.set_state(ContractAdd.vehicle)
-        await callback.message.answer(
+        await _flow_answer(
+            callback.message,
+            "contract_add",
             "Для КАСКО: какой автомобиль? (например: Toyota Camry 2020)",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=to_main_menu_keyboard(),
         )
     else:
-        await state.set_state(ContractAdd.start_date)
-        await callback.message.answer(
-            f"Дата начала договора? (например: 20.03.2026)\nВалюта: {currency}",
+        await state.set_state(ContractAdd.signing_date)
+        await _flow_answer(
+            callback.message,
+            "contract_add",
+            f"Дата заключения договора (дата оплаты первоначального взноса)? (например: 20.03.2026)\nВалюта: {currency}",
         )
     await callback.answer()
+
+
+@router.message(ContractAdd.signing_date)
+async def contract_step_signing_date(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    res = parse_date_ru(message.text or "", today=date.today())
+    if res is None:
+        await _flow_answer(message, "contract_add", "Не понял дату. Пример: 20.03.2026")
+        return
+    await state.update_data(signing_date_iso=res.target_date.isoformat())
+    await state.set_state(ContractAdd.start_date)
+    await _flow_answer(message, "contract_add", "Дата начала действия договора? (например: 20.03.2026)")
 
 
 @router.message(ContractAdd.start_date)
@@ -802,11 +997,28 @@ async def contract_step_start_date(message: Message, state: FSMContext) -> None:
         return
     res = parse_date_ru(message.text or "", today=date.today())
     if res is None:
-        await message.answer("Не понял дату. Пример: 20.03.2026")
+        await _flow_answer(message, "contract_add", "Не понял дату. Пример: 20.03.2026")
         return
     await state.update_data(start_date_iso=res.target_date.isoformat())
-    await state.set_state(ContractAdd.end_date)
-    await message.answer("Дата окончания договора? (например: 20.03.2026)")
+    data = await state.get_data()
+    kind_key = str(data.get("contract_kind_key") or "")
+    if kind_key == "accident":
+        # For travel insurance duration is flexible; ask explicit end date.
+        await state.set_state(ContractAdd.end_date)
+        await _flow_answer(message, "contract_add", "Дата окончания договора? (например: 20.03.2026)")
+        return
+
+    # For all other types end date is automatically start + 1 year.
+    end_date = _add_months(res.target_date, 12) - timedelta(days=1)
+    await state.update_data(end_date_iso=end_date.isoformat())
+    await state.set_state(ContractAdd.total_amount)
+    currency = str(data.get("currency") or "BYN")
+    await _flow_answer(
+        message,
+        "contract_add",
+        f"Дата окончания рассчитана автоматически: {end_date:%d.%m.%Y}\n"
+        f"Страховой взнос (годовой, {currency}), число. Например: 1500.50"
+    )
 
 
 @router.message(ContractAdd.vehicle)
@@ -815,14 +1027,16 @@ async def contract_step_vehicle(message: Message, state: FSMContext) -> None:
         return
     txt = (message.text or "").strip()
     if len(txt) < 3:
-        await message.answer("Введите автомобиль чуть подробнее (минимум 3 символа).")
+        await _flow_answer(message, "contract_add", "Введите автомобиль чуть подробнее (минимум 3 символа).")
         return
     await state.update_data(contract_vehicle=txt)
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
-    await state.set_state(ContractAdd.start_date)
-    await message.answer(
-        f"Дата начала договора? (например: 20.03.2026)\nВалюта: {currency}",
+    await state.set_state(ContractAdd.signing_date)
+    await _flow_answer(
+        message,
+        "contract_add",
+        f"Дата заключения договора (дата оплаты первоначального взноса)? (например: 20.03.2026)\nВалюта: {currency}",
     )
 
 
@@ -832,13 +1046,120 @@ async def contract_step_end_date(message: Message, state: FSMContext) -> None:
         return
     res = parse_date_ru(message.text or "", today=date.today())
     if res is None:
-        await message.answer("Не понял дату. Пример: 20.03.2026")
+        await _flow_answer(message, "contract_add", "Не понял дату. Пример: 20.03.2026")
         return
     await state.update_data(end_date_iso=res.target_date.isoformat())
     await state.set_state(ContractAdd.total_amount)
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
-    await message.answer(f"Сумма договора ({currency}), число. Например: 1500.50")
+    await _flow_answer(message, "contract_add", f"Страховой взнос (годовой, {currency}), число. Например: 1500.50")
+
+
+def _add_months(src: date, months: int) -> date:
+    y = src.year + (src.month - 1 + months) // 12
+    m = (src.month - 1 + months) % 12 + 1
+    d = min(src.day, calendar.monthrange(y, m)[1])
+    return date(y, m, d)
+
+
+def _build_auto_schedule(annual_total_minor: int, initial_minor: int, start_date: date, stages: int) -> list[dict[str, str | int]]:
+    """
+    Build pending schedule (excluding first paid installment).
+    stages: total number of payment stages in year (1/2/4/12).
+    """
+    if stages <= 1:
+        return []
+
+    remainder = max(0, annual_total_minor - initial_minor)
+    n = stages - 1
+    if n <= 0 or remainder <= 0:
+        return []
+
+    base = remainder // n
+    rem = remainder % n
+    interval_months = max(1, 12 // stages)
+    rows: list[dict[str, str | int]] = []
+    for i in range(1, n + 1):
+        amount_minor = base + (1 if i <= rem else 0)
+        # End of each period is one day before next period boundary.
+        due = _add_months(start_date, interval_months * i) - timedelta(days=1)
+        rows.append({"amount_minor": amount_minor, "due_iso": due.isoformat()})
+    return rows
+
+
+async def _persist_contract_from_state(agent_id: int, state: FSMContext, message: Message) -> tuple[object | None, int]:
+    data = await state.get_data()
+    client_id = int(data["contract_add_client_id"])
+    contract_id = data.get("contract_edit_id")
+    contract_number = str(data["contract_number"])
+    company = str(data["contract_company"])
+    contract_kind = str(data["contract_kind"])
+    vehicle_description = data.get("contract_vehicle")
+    start_date_iso = str(data["start_date_iso"])
+    end_date_iso = str(data["end_date_iso"])
+    total_amount_minor = int(data["total_amount_minor"])
+    insured_sum_minor = int(data.get("insured_sum_minor") or 0) or None
+    currency = str(data.get("currency") or "BYN")
+    initial_payment_minor = int(data["initial_payment_minor"])
+    signing_date_iso = str(data["signing_date_iso"])
+
+    payments = list(data.get("payments") or [])
+    payments_typed: list[tuple[int, date]] = [
+        (int(p["amount_minor"]), date.fromisoformat(str(p["due_iso"]))) for p in payments
+    ]
+
+    if contract_id is None:
+        ct = await create_contract_for_client(
+            agent_tg_id=agent_id,
+            client_id=client_id,
+            contract_number=contract_number,
+            company=company,
+            contract_kind=contract_kind,
+            start_date=date.fromisoformat(start_date_iso),
+            end_date=date.fromisoformat(end_date_iso),
+            total_amount_minor=total_amount_minor,
+            insured_sum_minor=insured_sum_minor,
+            currency=currency,
+            initial_payment_amount_minor=initial_payment_minor,
+            initial_payment_due_date=date.fromisoformat(signing_date_iso),
+            vehicle_description=vehicle_description,
+            payments=payments_typed,
+        )
+    else:
+        ct = await update_contract_for_client(
+            agent_tg_id=agent_id,
+            contract_id=int(contract_id),
+            contract_number=contract_number,
+            company=company,
+            contract_kind=contract_kind,
+            start_date=date.fromisoformat(start_date_iso),
+            end_date=date.fromisoformat(end_date_iso),
+            total_amount_minor=total_amount_minor,
+            insured_sum_minor=insured_sum_minor,
+            currency=currency,
+            initial_payment_amount_minor=initial_payment_minor,
+            initial_payment_due_date=date.fromisoformat(signing_date_iso),
+            vehicle_description=vehicle_description,
+            payments=payments_typed,
+        )
+
+    await state.clear()
+    if ct is None:
+        await message.answer("Не удалось сохранить договор. Проверьте данные.", reply_markup=clients_menu_keyboard())
+        return None, client_id
+
+    await message.answer(f"✅ Договор сохранён: #{ct.id} • {ct.contract_number}", reply_markup=clients_menu_keyboard())
+    await message.answer(
+        "Что дальше?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📎 Добавить фото договора", callback_data=f"contract:add_doc:{ct.id}")],
+                [InlineKeyboardButton(text="👀 Открыть договор", callback_data=f"client:view_contract:{ct.id}")],
+                [InlineKeyboardButton(text="⬅️ К карточке клиента", callback_data=f"client:open:{client_id}")],
+            ]
+        ),
+    )
+    return ct, client_id
 
 
 @router.message(ContractAdd.total_amount)
@@ -849,26 +1170,210 @@ async def contract_step_total_amount(message: Message, state: FSMContext) -> Non
     try:
         val = float(txt)
     except ValueError:
-        await message.answer("Сумма должна быть числом. Например: 1500.50")
+        await _flow_answer(message, "contract_add", "Сумма должна быть числом. Например: 1500.50")
         return
     if val <= 0:
-        await message.answer("Сумма должна быть больше 0.")
+        await _flow_answer(message, "contract_add", "Сумма должна быть больше 0.")
         return
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
     await state.update_data(total_amount_minor=int(round(val * 100)), currency=currency)
-    await state.set_state(ContractAdd.payments_count)
-    await message.answer("График платежей: сколько платежей (1..24)?")
+    await state.set_state(ContractAdd.insured_sum)
+    await _flow_answer(message, "contract_add", f"Страховая сумма ({currency}), число. Например: 20000")
+
+
+@router.message(ContractAdd.insured_sum)
+async def contract_step_insured_sum(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        val = float(txt)
+    except ValueError:
+        await message.answer("Страховая сумма должна быть числом. Например: 20000")
+        return
+    if val <= 0:
+        await message.answer("Страховая сумма должна быть больше 0.")
+        return
+    await state.update_data(insured_sum_minor=int(round(val * 100)))
+    await state.set_state(ContractAdd.payment_plan)
+    await message.answer(
+        "Выбери график оплаты:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Единовременно", callback_data="client:plan:1")],
+                [InlineKeyboardButton(text="В 2 этапа", callback_data="client:plan:2")],
+                [InlineKeyboardButton(text="В 4 этапа", callback_data="client:plan:4")],
+                [InlineKeyboardButton(text="В 12 этапов", callback_data="client:plan:12")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(ContractAdd.payment_plan, F.data.startswith("client:plan:"))
+async def contract_step_payment_plan(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        stages = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный график", show_alert=True)
+        return
+    if stages not in (1, 2, 4, 12):
+        await callback.answer("Некорректный график", show_alert=True)
+        return
+
+    await state.update_data(plan_stages=stages)
+    data = await state.get_data()
+    total_amount_minor = int(data["total_amount_minor"])
+    currency = str(data.get("currency") or "BYN")
+    if stages == 1:
+        # One-time: initial paid installment equals annual total.
+        await state.update_data(
+            initial_payment_minor=total_amount_minor,
+            payments=[],
+            payments_expected=0,
+            payment_idx=0,
+        )
+        await state.set_state(ContractAdd.auto_plan_confirm)
+        signing_date_iso = str(data["signing_date_iso"])
+        await callback.message.answer(
+            "Проверь график перед сохранением:\n"
+            f"• 1-й взнос (оплачен): {date.fromisoformat(signing_date_iso):%d.%m.%Y} — {total_amount_minor/100:.2f} {currency}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Сохранить", callback_data="client:plan:confirm_save")],
+                ]
+            ),
+        )
+        await callback.answer()
+        return
+
+    await state.set_state(ContractAdd.initial_payment_amount)
+    await callback.message.answer(f"Первоначальный взнос ({currency}), число. Например: 150.50")
+    await callback.answer()
+
+
+@router.message(ContractAdd.initial_payment_amount)
+async def contract_step_initial_payment_amount(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        val = float(txt)
+    except ValueError:
+        await message.answer("Первоначальный взнос должен быть числом. Например: 150.50")
+        return
+    if val <= 0:
+        await message.answer("Первоначальный взнос должен быть > 0.")
+        return
+
+    data = await state.get_data()
+    currency = str(data.get("currency") or "BYN")
+    initial_payment_minor = int(round(val * 100))
+    total_amount_minor = int(data["total_amount_minor"])
+    if initial_payment_minor > total_amount_minor:
+        await message.answer("Первоначальный взнос не может быть больше годового взноса.")
+        return
+
+    stages = int(data["plan_stages"])
+    start_date_iso = str(data["start_date_iso"])
+    start_date_val = date.fromisoformat(start_date_iso)
+    auto_payments = _build_auto_schedule(
+        annual_total_minor=total_amount_minor,
+        initial_minor=initial_payment_minor,
+        start_date=start_date_val,
+        stages=stages,
+    )
+
+    await state.update_data(
+        initial_payment_minor=initial_payment_minor,
+        payments=auto_payments,
+        payments_expected=len(auto_payments),
+        payment_idx=0,
+        currency=currency,
+    )
+    await state.set_state(ContractAdd.auto_plan_confirm)
+
+    signing_date_iso = str(data["signing_date_iso"])
+    remainder_minor = max(0, total_amount_minor - initial_payment_minor)
+    lines = [
+        "Проверь график перед сохранением:",
+        f"• Годовой взнос: {total_amount_minor/100:.2f} {currency}",
+        f"• Первоначальный: {initial_payment_minor/100:.2f} {currency}",
+        f"• Остаток: {remainder_minor/100:.2f} {currency}",
+        f"• Этапов оплаты: {stages}",
+        "",
+        f"• 1-й взнос (оплачен): {date.fromisoformat(signing_date_iso):%d.%m.%Y} — {initial_payment_minor/100:.2f} {currency}",
+    ]
+    for idx, p in enumerate(auto_payments, start=2):
+        lines.append(f"• {idx}-й взнос: {date.fromisoformat(str(p['due_iso'])):%d.%m.%Y} — {int(p['amount_minor'])/100:.2f} {currency}")
+    if not auto_payments:
+        lines.append("• Дальнейших платежей нет (остаток 0.00).")
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Сохранить", callback_data="client:plan:confirm_save")],
+                [InlineKeyboardButton(text="✏️ Изменить этапы вручную", callback_data="client:plan:manual_edit")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(ContractAdd.auto_plan_confirm, F.data == "client:plan:confirm_save")
+async def contract_auto_plan_confirm_save(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await _persist_contract_from_state(callback.from_user.id, state, callback.message)
+    await callback.answer()
+
+
+@router.callback_query(ContractAdd.auto_plan_confirm, F.data == "client:plan:manual_edit")
+async def contract_auto_plan_manual_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    data = await state.get_data()
+    auto_payments = list(data.get("payments") or [])
+    n = len(auto_payments)
+    if n <= 0:
+        await callback.message.answer("Нет этапов для ручного редактирования. Можно сохранить текущий график.")
+        await callback.answer()
+        return
+    await state.update_data(payments_expected=n, payment_idx=0, payments=[])
+    await state.set_state(ContractAdd.payment_amount)
+    currency = str(data.get("currency") or "BYN")
+    await callback.message.answer(f"Платёж 2: сумма ({currency}), число.")
+    await callback.answer()
 
 
 @router.message(ContractAdd.payments_count)
 async def contract_step_payments_count(message: Message, state: FSMContext) -> None:
     if not await _ensure_agent(message):
         return
+    raw = (message.text or "").strip().replace(" ", "").replace(",", ".")
     try:
-        n = int((message.text or "").strip())
+        # Allow: 3, 3.0, 3,0
+        n_float = float(raw)
+        n = int(n_float)
     except ValueError:
         await message.answer("Введите число платежей, например: 3")
+        return
+    if abs(n_float - n) > 1e-9:
+        await message.answer("Количество платежей должно быть целым числом, например: 3")
         return
     if n < 1 or n > 24:
         await message.answer("Количество платежей должно быть от 1 до 24.")
@@ -877,7 +1382,7 @@ async def contract_step_payments_count(message: Message, state: FSMContext) -> N
     await state.set_state(ContractAdd.payment_amount)
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
-    await message.answer(f"Платёж 1: сумма ({currency}), число.")
+    await message.answer(f"Платёж 2: сумма ({currency}), число.")
 
 
 @router.message(ContractAdd.payment_amount)
@@ -898,7 +1403,7 @@ async def contract_step_payment_amount(message: Message, state: FSMContext) -> N
     await state.set_state(ContractAdd.payment_due_date)
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
-    await message.answer(f"Платёж {idx + 1}: дата платежа (например: 20.03.2026)\nВалюта: {currency}")
+    await message.answer(f"Платёж {idx + 2}: дата платежа (например: 20.03.2026)\nВалюта: {currency}")
 
 
 @router.message(ContractAdd.payment_due_date)
@@ -920,74 +1425,12 @@ async def contract_step_payment_due_date(message: Message, state: FSMContext) ->
 
     await state.update_data(payments=payments, payment_idx=idx)
     if idx >= n_expected:
-        # Finish and persist.
-        agent_id = message.from_user.id
-        client_id = int(data["contract_add_client_id"])
-        contract_id = data.get("contract_edit_id")
-        contract_number = str(data["contract_number"])
-        company = str(data["contract_company"])
-        contract_kind = str(data["contract_kind"])
-        vehicle_description = data.get("contract_vehicle")
-        start_date_iso = str(data["start_date_iso"])
-        end_date_iso = str(data["end_date_iso"])
-        total_amount_minor = int(data["total_amount_minor"])
-        currency = str(data.get("currency") or "BYN")
-
-        payments_typed: list[tuple[int, date]] = [
-            (p["amount_minor"], date.fromisoformat(p["due_iso"])) for p in payments
-        ]
-
-        if contract_id is None:
-            ct = await create_contract_for_client(
-                agent_tg_id=agent_id,
-                client_id=client_id,
-                contract_number=contract_number,
-                company=company,
-                contract_kind=contract_kind,
-                start_date=date.fromisoformat(start_date_iso),
-                end_date=date.fromisoformat(end_date_iso),
-                total_amount_minor=total_amount_minor,
-                currency=currency,
-                vehicle_description=vehicle_description,
-                payments=payments_typed,
-            )
-        else:
-            ct = await update_contract_for_client(
-                agent_tg_id=agent_id,
-                contract_id=int(contract_id),
-                contract_number=contract_number,
-                company=company,
-                contract_kind=contract_kind,
-                start_date=date.fromisoformat(start_date_iso),
-                end_date=date.fromisoformat(end_date_iso),
-                total_amount_minor=total_amount_minor,
-                currency=currency,
-                vehicle_description=vehicle_description,
-                payments=payments_typed,
-            )
-
-        await state.clear()
-        if ct is None:
-            await message.answer("Не удалось сохранить договор. Проверьте данные.", reply_markup=clients_menu_keyboard())
-            return
-
-        await message.answer(f"✅ Договор сохранён: #{ct.id} • {ct.contract_number}", reply_markup=clients_menu_keyboard())
-        # Ask next action for contract docs / navigation.
-        await message.answer(
-            "Что дальше?",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="📎 Добавить фото договора", callback_data=f"contract:add_doc:{ct.id}")],
-                    [InlineKeyboardButton(text="👀 Открыть договор", callback_data=f"client:view_contract:{ct.id}")],
-                    [InlineKeyboardButton(text="⬅️ К карточке клиента", callback_data=f"client:open:{client_id}")],
-                ]
-            ),
-        )
+        await _persist_contract_from_state(message.from_user.id, state, message)
         return
 
     await state.set_state(ContractAdd.payment_amount)
     currency_next = str(data.get("currency") or "BYN")
-    await message.answer(f"Платёж {idx + 1}: сумма ({currency_next}), число.")
+    await message.answer(f"Платёж {idx + 2}: сумма ({currency_next}), число.")
 
 
 async def _build_contract_view_text(
@@ -1016,11 +1459,26 @@ async def _build_contract_view_text(
     if exclude_contract_document_ids:
         contract_docs = [d for d in contract_docs if d.id not in exclude_contract_document_ids]
 
+    terminate_rows = (
+        [[InlineKeyboardButton(text="🛑 Прекратить договор", callback_data=f"contract:terminate:{ct.id}")]]
+        if ct.status == ContractStatus.active
+        else []
+    )
+
+    pending_exists = ct.status == ContractStatus.active and any(p.status == PaymentStatus.pending for p in ct.payments)
+    mark_rows = (
+        [[InlineKeyboardButton(text="💳 Отметить взнос", callback_data=f"contract:mark_payment_start:{ct.id}")]]
+        if pending_exists
+        else []
+    )
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Редактировать договор", callback_data=f"client:edit_contract:{ct.id}")],
             [InlineKeyboardButton(text="⬅️ Назад к клиенту", callback_data=f"client:open:{ct.client_id}")],
             [InlineKeyboardButton(text="📎 Добавить фото договора", callback_data=f"contract:add_doc:{ct.id}")],
+            *terminate_rows,
+            *mark_rows,
             [InlineKeyboardButton(text="🗑 Удалить договор", callback_data=f"contract:delete:{ct.id}")],
         ]
     )
@@ -1032,8 +1490,14 @@ async def _build_contract_view_text(
         f"Вид: {_kind_short(ct.contract_kind)[0]}\n"
         + (f"Авто: {ct.vehicle_description}\n" if ct.vehicle_description else "")
         + f"Даты: {ct.start_date:%d.%m.%Y} - {ct.end_date:%d.%m.%Y}\n"
-        f"Сумма: {ct.total_amount_minor/100:.2f} {ct.currency}\n\n"
-        f"График платежей:\n"
+        + f"Статус: {'действует' if ct.status == ContractStatus.active else 'прекращен'}\n"
+        + f"Страховой взнос (годовой): {ct.total_amount_minor/100:.2f} {ct.currency}\n"
+        + (
+            f"Страховая сумма: {ct.insured_sum_minor/100:.2f} {ct.currency}\n\n"
+            if ct.insured_sum_minor is not None
+            else "\n"
+        )
+        + f"График платежей:\n"
         + ("\n".join(payments_lines) if payments_lines else "— нет платежей")
     )
 
@@ -1085,11 +1549,26 @@ async def view_contract(callback: CallbackQuery) -> None:
 
     contract_docs = await list_contract_documents(callback.from_user.id, ct.id, limit=5)
 
+    terminate_rows = (
+        [[InlineKeyboardButton(text="🛑 Прекратить договор", callback_data=f"contract:terminate:{ct.id}")]]
+        if ct.status == ContractStatus.active
+        else []
+    )
+
+    pending_exists = ct.status == ContractStatus.active and any(p.status == PaymentStatus.pending for p in ct.payments)
+    mark_rows = (
+        [[InlineKeyboardButton(text="💳 Отметить взнос", callback_data=f"contract:mark_payment_start:{ct.id}")]]
+        if pending_exists
+        else []
+    )
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Редактировать договор", callback_data=f"client:edit_contract:{ct.id}")],
             [InlineKeyboardButton(text="⬅️ Назад к клиенту", callback_data=f"client:open:{ct.client_id}")],
             [InlineKeyboardButton(text="📎 Добавить фото договора", callback_data=f"contract:add_doc:{ct.id}")],
+            *terminate_rows,
+            *mark_rows,
             [InlineKeyboardButton(text="🗑 Удалить договор", callback_data=f"contract:delete:{ct.id}")],
         ]
     )
@@ -1101,8 +1580,14 @@ async def view_contract(callback: CallbackQuery) -> None:
         f"Вид: {_kind_short(ct.contract_kind)[0]}\n"
         + (f"Авто: {ct.vehicle_description}\n" if ct.vehicle_description else "")
         + f"Даты: {ct.start_date:%d.%m.%Y} - {ct.end_date:%d.%m.%Y}\n"
-        f"Сумма: {ct.total_amount_minor/100:.2f} {ct.currency}\n\n"
-        f"График платежей:\n"
+        + f"Статус: {'действует' if ct.status == ContractStatus.active else 'прекращен'}\n"
+        + f"Страховой взнос (годовой): {ct.total_amount_minor/100:.2f} {ct.currency}\n"
+        + (
+            f"Страховая сумма: {ct.insured_sum_minor/100:.2f} {ct.currency}\n\n"
+            if ct.insured_sum_minor is not None
+            else "\n"
+        )
+        + f"График платежей:\n"
         + ("\n".join(payments_lines) if payments_lines else "— нет платежей")
     )
     # If user entered "Другой: <subtype>", show subtype line.
@@ -1145,7 +1630,7 @@ async def start_add_client_doc(callback: CallbackQuery, state: FSMContext) -> No
     await callback.message.answer(
         "Отправь фото документов для клиента. "
         "Можно добавить подпись к фото (не обязательно).",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=to_main_menu_keyboard(),
     )
     await callback.answer()
 
@@ -1170,7 +1655,7 @@ async def start_add_contract_doc(callback: CallbackQuery, state: FSMContext) -> 
     await callback.message.answer(
         "Отправь фото документов к договору. "
         "Можно добавить подпись к фото (не обязательно).",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=to_main_menu_keyboard(),
     )
     await callback.answer()
 
@@ -1557,6 +2042,156 @@ async def delete_contract_confirm(callback: CallbackQuery) -> None:
         return
     ok = await delete_contract(callback.from_user.id, contract_id)
     await callback.message.answer("✅ Договор удалён." if ok else "Не удалось удалить (проверьте доступ).")
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^contract:terminate:\d+$"))
+async def terminate_contract_start(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        contract_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    await callback.message.answer(
+        "Прекратить договор? (дальнейшие шаги оплаты/комиссий будут учитывать прекращение)",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да, прекратить", callback_data=f"contract:terminate_confirm:{contract_id}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="contract:terminate_cancel")],
+            ]
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "contract:terminate_cancel")
+async def terminate_contract_cancel(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^contract:terminate_confirm:\d+$"))
+async def terminate_contract_confirm(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        contract_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    ok = await terminate_contract(callback.from_user.id, contract_id)
+    if ok:
+        text, kb = await _build_contract_view_text(callback.from_user.id, contract_id)
+        await callback.message.answer(text, reply_markup=kb)
+    else:
+        await callback.message.answer("Не удалось прекратить договор (проверьте доступ).")
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^contract:mark_payment_start:\d+$"))
+async def contract_mark_payment_start(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    try:
+        contract_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    ct = await get_contract_detailed(callback.from_user.id, contract_id)
+    if ct is None:
+        await callback.answer("Договор не найден", show_alert=True)
+        return
+
+    pending: list[tuple[int, object]] = []
+    for idx, p in enumerate(ct.payments, start=1):
+        if p.status == PaymentStatus.pending:
+            pending.append((idx, p))
+
+    if not pending:
+        await callback.answer("Нет ожидающих взносов", show_alert=True)
+        return
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for idx, p in pending:
+        label = f"Взнос {idx}: {p.amount_minor/100:.2f} {ct.currency}"
+        row.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"contract:mark_payment_confirm:{p.id}",
+            )
+        )
+        if len(row) >= 2:
+            kb_rows.append(row)
+            row = []
+    if row:
+        kb_rows.append(row)
+
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"contract:mark_payment_back:{ct.id}")])
+
+    await callback.message.answer("Выберите взнос:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("contract:mark_payment_back:"))
+async def contract_mark_payment_back(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    try:
+        contract_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    text, kb = await _build_contract_view_text(callback.from_user.id, contract_id)
+    await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^contract:mark_payment_confirm:\d+$"))
+async def contract_mark_payment_confirm(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    try:
+        payment_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+
+    contract_id = await mark_payment_paid(callback.from_user.id, payment_id)
+    if contract_id is None:
+        await callback.answer("Не удалось отметить взнос", show_alert=True)
+        return
+
+    text, kb = await _build_contract_view_text(callback.from_user.id, contract_id)
+    await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
 
 

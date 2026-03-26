@@ -5,11 +5,11 @@ from datetime import date
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, Message
 
 from bot.db.models import UserRole
 from bot.db.repo import create_application_from_quote, create_kasko_quote, get_or_create_user
-from bot.keyboards import Btn, apply_quote_keyboard, client_menu, insurance_type_keyboard
+from bot.keyboards import Btn, apply_quote_keyboard, client_menu, insurance_type_keyboard, to_main_menu_keyboard
 from bot.services.kasko import KaskoInput, calculate_kasko
 
 router = Router()
@@ -74,7 +74,7 @@ async def pick_calc_type(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(PropertyCalc.full_name)
         await callback.message.answer(
             "🏠 Расчёт страхования имущества.\nКак вас зовут? Можно написать “отмена”.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=to_main_menu_keyboard(),
         )
         await callback.answer()
         return
@@ -97,7 +97,7 @@ async def pick_calc_type(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(KaskoCalc.full_name)
     await callback.message.answer(
         "🧮 Расчёт КАСКО.\nКак вас зовут? Можно написать “отмена”.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=to_main_menu_keyboard(),
     )
     await callback.answer()
 @router.message(KaskoCalc.full_name)
@@ -264,7 +264,7 @@ async def step_youngest_age(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Меню.", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu())
 
 
 @router.callback_query(F.data.startswith("quote_apply:"))

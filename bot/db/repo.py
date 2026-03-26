@@ -2,17 +2,20 @@ import json
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from bot.db.base import get_session_maker
 from bot.db.models import (
+    AgentCommission,
+    ApplicationNote,
     Application,
     ApplicationStatus,
     Client,
     ClientDocument,
     ContractDocument,
     Contract,
+    ContractStatus,
     Payment,
     PaymentStatus,
     Quote,
@@ -249,11 +252,223 @@ async def set_application_status(app_id: int, status: ApplicationStatus) -> Appl
         return app
 
 
+async def delete_application(app_id: int) -> Application | None:
+    async with get_session_maker()() as session:
+        res = await session.execute(select(Application).where(Application.id == app_id))
+        app = res.scalar_one_or_none()
+        if app is None:
+            return None
+        await session.delete(app)
+        await session.commit()
+        return app
+
+
+async def create_application_note(agent_tg_id: int, app_id: int, text_value: str) -> ApplicationNote | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        app_res = await session.execute(select(Application).where(Application.id == app_id))
+        app = app_res.scalar_one_or_none()
+        if app is None or app.status != ApplicationStatus.in_progress:
+            return None
+        note = ApplicationNote(application_id=app_id, agent_user_id=user.id, text=text_value.strip())
+        session.add(note)
+        await session.commit()
+        await session.refresh(note)
+        return note
+
+
+async def list_notes_for_application(agent_tg_id: int, app_id: int, limit: int = 20) -> list[ApplicationNote]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        app_res = await session.execute(select(Application).where(Application.id == app_id))
+        app = app_res.scalar_one_or_none()
+        if app is None:
+            return []
+        res = await session.execute(
+            select(ApplicationNote)
+            .where(ApplicationNote.agent_user_id == user.id, ApplicationNote.application_id == app_id)
+            .order_by(ApplicationNote.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def list_notes_for_agent(agent_tg_id: int, limit: int = 50) -> list[ApplicationNote]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        res = await session.execute(
+            select(ApplicationNote)
+            .options(selectinload(ApplicationNote.application))
+            .where(ApplicationNote.agent_user_id == user.id)
+            .order_by(ApplicationNote.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def get_note_for_agent(agent_tg_id: int, note_id: int) -> ApplicationNote | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        res = await session.execute(
+            select(ApplicationNote)
+            .options(selectinload(ApplicationNote.application))
+            .where(ApplicationNote.id == note_id, ApplicationNote.agent_user_id == user.id)
+        )
+        return res.scalar_one_or_none()
+
+
+async def delete_note_for_agent(agent_tg_id: int, note_id: int) -> bool:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return False
+        res = await session.execute(
+            select(ApplicationNote).where(
+                ApplicationNote.id == note_id,
+                ApplicationNote.agent_user_id == user.id,
+            )
+        )
+        note = res.scalar_one_or_none()
+        if note is None:
+            return False
+        await session.delete(note)
+        await session.commit()
+        return True
+
+
+async def list_agent_companies_for_commission(agent_tg_id: int, limit: int = 200) -> list[str]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        contract_rows = await session.execute(
+            select(func.distinct(Contract.company))
+            .join(Client, Client.id == Contract.client_id)
+            .where(Client.agent_user_id == user.id)
+            .limit(limit)
+        )
+        commission_rows = await session.execute(
+            select(func.distinct(AgentCommission.company))
+            .where(AgentCommission.agent_user_id == user.id)
+            .limit(limit)
+        )
+        companies = {
+            str(v).strip()
+            for v in list(contract_rows.scalars().all()) + list(commission_rows.scalars().all())
+            if v is not None and str(v).strip()
+        }
+        return sorted(companies)
+
+
+async def list_agent_contract_kinds_for_company(agent_tg_id: int, company: str, limit: int = 200) -> list[str]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        c = company.strip()
+        contract_rows = await session.execute(
+            select(func.distinct(Contract.contract_kind))
+            .join(Client, Client.id == Contract.client_id)
+            .where(Client.agent_user_id == user.id, Contract.company == c)
+            .limit(limit)
+        )
+        commission_rows = await session.execute(
+            select(func.distinct(AgentCommission.contract_kind))
+            .where(AgentCommission.agent_user_id == user.id, AgentCommission.company == c)
+            .limit(limit)
+        )
+        kinds = {
+            str(v).strip()
+            for v in list(contract_rows.scalars().all()) + list(commission_rows.scalars().all())
+            if v is not None and str(v).strip()
+        }
+        return sorted(kinds)
+
+
+async def upsert_agent_commission(
+    agent_tg_id: int,
+    company: str,
+    contract_kind: str,
+    percent_bp: int,
+) -> AgentCommission | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        c = company.strip()
+        k = contract_kind.strip()
+        res = await session.execute(
+            select(AgentCommission).where(
+                AgentCommission.agent_user_id == user.id,
+                AgentCommission.company == c,
+                AgentCommission.contract_kind == k,
+            )
+        )
+        row = res.scalar_one_or_none()
+        if row is None:
+            row = AgentCommission(agent_user_id=user.id, company=c, contract_kind=k, percent_bp=percent_bp)
+            session.add(row)
+        else:
+            row.percent_bp = percent_bp
+        await session.commit()
+        await session.refresh(row)
+        return row
+
+
+async def list_agent_commissions(agent_tg_id: int, limit: int = 2000) -> list[AgentCommission]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        res = await session.execute(
+            select(AgentCommission)
+            .where(AgentCommission.agent_user_id == user.id)
+            .order_by(AgentCommission.company.asc(), AgentCommission.contract_kind.asc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def list_agent_company_kind_pairs(agent_tg_id: int, limit: int = 5000) -> list[tuple[str, str]]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        res = await session.execute(
+            select(Contract.company, Contract.contract_kind)
+            .join(Client, Client.id == Contract.client_id)
+            .where(Client.agent_user_id == user.id)
+            .distinct()
+            .limit(limit)
+        )
+        pairs = [(str(c).strip(), str(k).strip()) for c, k in res.all() if c and k]
+        return sorted(pairs, key=lambda x: (x[0], x[1]))
+
+
 async def create_reminder(
     agent_tg_id: int,
     text_value: str,
     remind_at_utc: datetime,
     repeat: ReminderRepeat = ReminderRepeat.none,
+    note_id: int | None = None,
 ) -> Reminder:
     if remind_at_utc.tzinfo is None:
         raise ValueError("remind_at_utc must be timezone-aware (UTC)")
@@ -273,6 +488,7 @@ async def create_reminder(
             remind_at=remind_at_utc,
             status=ReminderStatus.pending,
             repeat=repeat,
+            note_id=note_id,
         )
         session.add(r)
         await session.commit()
@@ -288,7 +504,10 @@ async def list_agent_reminders(agent_tg_id: int, limit: int = 10) -> list[Remind
             return []
         res = await session.execute(
             select(Reminder)
-            .where(Reminder.agent_user_id == user.id)
+            .where(
+                Reminder.agent_user_id == user.id,
+                Reminder.status == ReminderStatus.pending,
+            )
             .order_by(Reminder.remind_at.desc())
             .limit(limit)
         )
@@ -360,7 +579,7 @@ async def delete_reminder(reminder_id: int) -> None:
         r = res.scalar_one_or_none()
         if r is None:
             return
-        session.delete(r)
+        await session.delete(r)
         await session.commit()
 
 
@@ -493,7 +712,10 @@ async def create_contract_for_client(
     start_date: date,
     end_date: date,
     total_amount_minor: int,
+    insured_sum_minor: int | None,
     currency: str,
+    initial_payment_amount_minor: int,
+    initial_payment_due_date: date,
     payments: list[tuple[int, date]],  # (amount_minor, due_date)
     vehicle_description: str | None = None,
 ) -> Contract | None:
@@ -517,10 +739,22 @@ async def create_contract_for_client(
             start_date=start_date,
             end_date=end_date,
             total_amount_minor=total_amount_minor,
+            insured_sum_minor=insured_sum_minor,
             currency=currency,
         )
         session.add(contract)
         await session.flush()  # get contract.id
+
+        # Initial payment is always immediately paid at contract conclusion.
+        session.add(
+            Payment(
+                contract_id=contract.id,
+                amount_minor=initial_payment_amount_minor,
+                due_date=initial_payment_due_date,
+                status=PaymentStatus.paid,
+                paid_at=datetime.now(timezone.utc),
+            )
+        )
 
         for amount_minor, due_date in payments:
             session.add(
@@ -575,6 +809,53 @@ async def get_contract_detailed(agent_tg_id: int, contract_id: int) -> Contract 
         return contract
 
 
+async def search_contracts_by_number(agent_tg_id: int, query: str, limit: int = 10) -> list[Contract]:
+    """Search contracts for this agent by substring of contract_number."""
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return []
+
+        q = f"%{query.strip()}%"
+        res = await session.execute(
+            select(Contract)
+            .join(Client, Client.id == Contract.client_id)
+            .where(Client.agent_user_id == agent.id, Contract.contract_number.ilike(q))
+            .order_by(Contract.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def mark_payment_paid(agent_tg_id: int, payment_id: int) -> int | None:
+    """
+    Mark a specific payment as paid (agent-scoped).
+    Returns contract_id on success.
+    """
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(Payment)
+            .join(Contract, Contract.id == Payment.contract_id)
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                User.tg_id == agent_tg_id,
+                Payment.id == payment_id,
+                Payment.status == PaymentStatus.pending,
+                Contract.status == ContractStatus.active,
+            )
+        )
+        payment = res.scalar_one_or_none()
+        if payment is None:
+            return None
+
+        payment.status = PaymentStatus.paid
+        payment.paid_at = datetime.now(timezone.utc)
+        await session.commit()
+        return payment.contract_id
+
+
 async def update_contract_for_client(
     agent_tg_id: int,
     contract_id: int,
@@ -584,7 +865,10 @@ async def update_contract_for_client(
     start_date: date,
     end_date: date,
     total_amount_minor: int,
+    insured_sum_minor: int | None,
     currency: str,
+    initial_payment_amount_minor: int,
+    initial_payment_due_date: date,
     payments: list[tuple[int, date]],
     vehicle_description: str | None = None,
 ) -> Contract | None:
@@ -610,14 +894,25 @@ async def update_contract_for_client(
         contract.start_date = start_date
         contract.end_date = end_date
         contract.total_amount_minor = total_amount_minor
+        contract.insured_sum_minor = insured_sum_minor
         contract.currency = currency
 
         # Replace payment schedule.
         payments_res = await session.execute(select(Payment).where(Payment.contract_id == contract_id))
         existing = list(payments_res.scalars().all())
         for p in existing:
-            session.delete(p)
+            await session.delete(p)
         await session.flush()
+
+        session.add(
+            Payment(
+                contract_id=contract.id,
+                amount_minor=initial_payment_amount_minor,
+                due_date=initial_payment_due_date,
+                status=PaymentStatus.paid,
+                paid_at=datetime.now(timezone.utc),
+            )
+        )
 
         for amount_minor, due_date in payments:
             session.add(Payment(contract_id=contract.id, amount_minor=amount_minor, due_date=due_date, status=PaymentStatus.pending))
@@ -625,6 +920,29 @@ async def update_contract_for_client(
         await session.commit()
         await session.refresh(contract)
         return contract
+
+
+async def terminate_contract(agent_tg_id: int, contract_id: int) -> bool:
+    """Set contract status = terminated (agent-scoped)."""
+    async with get_session_maker()() as session:
+        res_u = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = res_u.scalar_one_or_none()
+        if agent is None:
+            return False
+
+        contract_res = await session.execute(
+            select(Contract).join(Client, Client.id == Contract.client_id).where(
+                Client.agent_user_id == agent.id,
+                Contract.id == contract_id,
+            )
+        )
+        contract = contract_res.scalar_one_or_none()
+        if contract is None:
+            return False
+
+        contract.status = ContractStatus.terminated
+        await session.commit()
+        return True
 
 
 async def create_client_document(

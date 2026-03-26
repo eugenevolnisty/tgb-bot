@@ -7,14 +7,14 @@ from zoneinfo import ZoneInfoNotFoundError
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.config import get_settings
 from bot.db.models import UserRole
 from bot.db.models import ReminderRepeat
-from bot.db.repo import cancel_reminder, create_reminder, get_or_create_user, list_agent_reminders
+from bot.db.repo import create_reminder, get_or_create_user, list_agent_reminders
 from bot.db.repo import delete_reminder, update_reminder_datetime
-from bot.keyboards import Btn, agent_menu
+from bot.keyboards import Btn, agent_menu, to_main_menu_keyboard
 from bot.services.datetime_parse import combine_local, parse_date_ru, parse_duration_ru, parse_relative_ru, parse_time_ru
 
 router = Router()
@@ -34,6 +34,7 @@ def reminders_menu_keyboard() -> "aiogram.types.ReplyKeyboardMarkup":
             [KeyboardButton(text=RemindersMenu.MY)],
             [KeyboardButton(text=RemindersMenu.CREATE)],
             [KeyboardButton(text=RemindersMenu.BACK)],
+            [KeyboardButton(text=Btn.MAIN_MENU)],
         ],
         resize_keyboard=True,
         input_field_placeholder="Напоминания",
@@ -79,7 +80,7 @@ async def open_reminders(message: Message) -> None:
 async def reminders_back(message: Message, state: FSMContext) -> None:
     if await state.get_state() is not None:
         await state.clear()
-    await message.answer("Меню.", reply_markup=agent_menu())
+    await message.answer("Главное меню", reply_markup=agent_menu())
 
 
 @router.message(F.text == RemindersMenu.MY)
@@ -114,7 +115,12 @@ async def my_reminders(message: Message) -> None:
                 [
                     InlineKeyboardButton(text="🕒 Изменить дату/время", callback_data=f"rem:edit:{r.id}"),
                     InlineKeyboardButton(text="🗑 Удалить", callback_data=f"rem:delete:{r.id}"),
-                ]
+                ],
+                *(
+                    [[InlineKeyboardButton(text="🗒 К заметке", callback_data=f"rem:note:{r.note_id}")]]
+                    if getattr(r, "note_id", None) is not None
+                    else []
+                ),
             ]
         )
         await message.answer(text, reply_markup=kb)
@@ -134,11 +140,12 @@ async def delete_from_list(callback: CallbackQuery) -> None:
         await callback.answer("Некорректный ID", show_alert=True)
         return
     await delete_reminder(reminder_id)
-    await callback.answer("Удалено")
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.delete()
     except Exception:
         pass
+    await callback.message.answer(f"🗑 Напоминание #{reminder_id} удалено.")
+    await callback.answer("Удалено")
 
 
 @router.callback_query(F.data.startswith("rem:edit:"))
@@ -158,7 +165,10 @@ async def edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await state.update_data(edit_reminder_id=reminder_id)
     await state.set_state(ReminderEdit.date)
-    await callback.message.answer("Новая дата? (завтра / в понедельник / 20.03.2026). Можно “отмена”.", reply_markup=ReplyKeyboardRemove())
+    await callback.message.answer(
+        "Новая дата? (завтра / в понедельник / 20.03.2026). Можно “отмена”.",
+        reply_markup=to_main_menu_keyboard(),
+    )
     await callback.answer()
 
 
@@ -257,7 +267,7 @@ async def start_create_reminder(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await state.set_state(ReminderCreate.text)
-    await message.answer("О чём напомнить? (текст). Можно написать “отмена”.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("О чём напомнить? (текст). Можно написать “отмена”.", reply_markup=to_main_menu_keyboard())
 
 
 @router.message(F.text.casefold() == "отмена")
@@ -525,6 +535,11 @@ async def cancel_from_message(callback: CallbackQuery) -> None:
     except Exception:
         await callback.answer("Некорректный ID", show_alert=True)
         return
-    await cancel_reminder(reminder_id)
-    await callback.answer("Отменено")
+    await delete_reminder(reminder_id)
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await callback.message.answer(f"🗑 Напоминание #{reminder_id} удалено.")
+    await callback.answer("Удалено")
 
