@@ -7,10 +7,12 @@ class Btn:
     ROLE_CLIENT = "🙋 Я клиент"
 
     # Client menu
-    CALC_PRICE = "🧮 Рассчитать стоимость"
+    CALC_PRICE = "🧮 Рассчитать стоимость и оставить заявку"
     LEAVE_APP = "📝 Оставить заявку"
     MY_CONTRACTS = "📄 Мои договоры"
     MY_DOCS = "📎 Мои документы"
+    CONTACT_AGENT = "📞 Связаться с агентом"
+    NEXT_PAYMENT = "⏳ Когда у меня ближайший взнос?"
     SWITCH_TO_AGENT = "🔁 Переключиться на агента"
 
     # Agent menu
@@ -37,14 +39,17 @@ def role_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def client_menu() -> ReplyKeyboardMarkup:
+def client_menu(*, allow_switch_to_agent: bool = False) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=Btn.CALC_PRICE)],
+        [KeyboardButton(text=Btn.MY_CONTRACTS), KeyboardButton(text=Btn.MY_DOCS)],
+        [KeyboardButton(text=Btn.CONTACT_AGENT)],
+        [KeyboardButton(text=Btn.NEXT_PAYMENT)],
+    ]
+    if allow_switch_to_agent:
+        rows.append([KeyboardButton(text=Btn.SWITCH_TO_AGENT)])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=Btn.CALC_PRICE)],
-            [KeyboardButton(text=Btn.LEAVE_APP)],
-            [KeyboardButton(text=Btn.MY_CONTRACTS), KeyboardButton(text=Btn.MY_DOCS)],
-            [KeyboardButton(text=Btn.SWITCH_TO_AGENT)],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
     )

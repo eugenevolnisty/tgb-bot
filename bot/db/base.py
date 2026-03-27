@@ -204,6 +204,46 @@ async def init_db() -> None:
             pass
         try:
             async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS users "
+                        "ADD COLUMN IF NOT EXISTS display_name VARCHAR(200) NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS users "
+                        "ADD COLUMN IF NOT EXISTS agent_contact_phones_json TEXT NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS users "
+                        "ADD COLUMN IF NOT EXISTS agent_contact_email VARCHAR(200) NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "ALTER TABLE IF EXISTS users "
+                        "ADD COLUMN IF NOT EXISTS agent_contact_telegram VARCHAR(100) NULL"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
                 await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_tenant_id ON users (tenant_id)"))
         except Exception:
             pass
@@ -325,6 +365,16 @@ async def init_db() -> None:
         try:
             async with conn.begin_nested():
                 await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_clients_source_user_id ON clients (source_user_id)"))
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS ux_clients_source_user_id_not_null "
+                        "ON clients (source_user_id) WHERE source_user_id IS NOT NULL"
+                    )
+                )
         except Exception:
             pass
 

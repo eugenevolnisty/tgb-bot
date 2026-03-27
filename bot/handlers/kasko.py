@@ -8,7 +8,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from bot.db.models import UserRole
-from bot.db.repo import create_application_from_quote, create_kasko_quote, get_or_create_user
+from bot.db.repo import (
+    create_application_from_quote,
+    create_kasko_quote,
+    get_bound_client_profile,
+    get_or_create_user,
+    list_tenant_agent_tg_ids_for_client,
+)
 from bot.keyboards import Btn, apply_quote_keyboard, client_menu, insurance_type_keyboard, to_main_menu_keyboard
 from bot.services.kasko import KaskoInput, calculate_kasko
 
@@ -282,6 +288,29 @@ async def apply_quote(callback: CallbackQuery) -> None:
         return
 
     app = await create_application_from_quote(callback.from_user.id, quote_id=quote_id)
+    profile = await get_bound_client_profile(callback.from_user.id)
+    profile_lines: list[str] = []
+    if profile is not None:
+        n, ph, em = profile
+        profile_lines = [
+            "Данные клиента из базы агента:",
+            f"- Имя: {n or '—'}",
+            f"- Телефон: {ph or '—'}",
+            f"- Email: {em or '—'}",
+            "",
+        ]
+    notify_text = (
+        f"📌 Заявка №{app.id}\n"
+        f"👤 Клиент: tg_id={callback.from_user.id}\n"
+        f"📎 Статус: new\n\n"
+        + "\n".join(profile_lines)
+        + (app.description or "")
+    )
+    for agent_tg_id in await list_tenant_agent_tg_ids_for_client(callback.from_user.id):
+        try:
+            await callback.bot.send_message(agent_tg_id, notify_text)
+        except Exception:
+            pass
     await callback.message.answer(f"Готово! Заявка №{app.id} создана и отправлена агенту.", reply_markup=client_menu())
     await callback.answer("Заявка создана")
 

@@ -28,6 +28,10 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tg_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    agent_contact_phones_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    agent_contact_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    agent_contact_telegram: Mapped[str | None] = mapped_column(String(100), nullable=True)
     tenant_id: Mapped[int | None] = mapped_column(ForeignKey("tenants.id", ondelete="SET NULL"), index=True, nullable=True)
     role: Mapped[UserRole | None] = mapped_column(Enum(UserRole, name="user_role"), nullable=True)
 

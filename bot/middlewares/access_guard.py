@@ -44,6 +44,7 @@ class AccessGuardMiddleware(BaseMiddleware):
         "client:",
         "contract:",
         "payins:",
+        "agentq:",
     )
 
     async def __call__(

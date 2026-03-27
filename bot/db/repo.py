@@ -89,6 +89,15 @@ def _hash_password(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200000).hex()
 
 
+def _profile_display_name(first_name: str | None, last_name: str | None, username: str | None, tg_id: int) -> str:
+    full = " ".join([p for p in [(first_name or "").strip(), (last_name or "").strip()] if p]).strip()
+    if full:
+        return full
+    if username:
+        return f"@{username.strip()}"
+    return f"Клиент tg_id={tg_id}"
+
+
 async def set_agent_password(agent_tg_id: int, password: str) -> bool:
     async with get_session_maker()() as session:
         user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
@@ -145,6 +154,87 @@ async def has_agent_password(agent_tg_id: int) -> bool:
         return cred_res.scalar_one_or_none() is not None
 
 
+async def get_user_display_name(tg_id: int) -> str | None:
+    async with get_session_maker()() as session:
+        res = await session.execute(select(User.display_name).where(User.tg_id == tg_id).limit(1))
+        return res.scalar_one_or_none()
+
+
+async def set_agent_display_name(agent_tg_id: int, display_name: str) -> bool:
+    name = (display_name or "").strip()
+    if len(name) < 2:
+        return False
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return False
+        if user.role != UserRole.agent:
+            return False
+        user.display_name = name[:200]
+        await session.commit()
+        return True
+
+
+async def get_agent_contacts(agent_tg_id: int) -> tuple[list[str], str | None, str | None]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return [], None, None
+        phones: list[str] = []
+        if user.agent_contact_phones_json:
+            try:
+                parsed = json.loads(user.agent_contact_phones_json)
+                if isinstance(parsed, list):
+                    phones = [str(x).strip() for x in parsed if str(x).strip()]
+            except Exception:
+                phones = []
+        return phones, (user.agent_contact_email or None), (user.agent_contact_telegram or None)
+
+
+async def set_agent_contacts(
+    agent_tg_id: int,
+    phones: list[str],
+    email: str | None,
+    telegram: str | None,
+) -> bool:
+    cleaned_phones = [str(p).strip() for p in phones if str(p).strip()]
+    cleaned_email = (email or "").strip() or None
+    cleaned_telegram = (telegram or "").strip().lstrip("@") or None
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent:
+            return False
+        user.agent_contact_phones_json = json.dumps(cleaned_phones, ensure_ascii=False)
+        user.agent_contact_email = cleaned_email
+        user.agent_contact_telegram = cleaned_telegram
+        await session.commit()
+        return True
+
+
+async def has_agent_footprint(tg_id: int) -> bool:
+    """
+    Dev helper: whether user already has agent-related entities.
+    Used to allow role switching for primary tester account.
+    """
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return False
+        if user.role == UserRole.agent:
+            return True
+        # Any existing agent credential means this account has agent setup.
+        cred_res = await session.execute(select(AgentCredential.id).where(AgentCredential.user_id == user.id).limit(1))
+        if cred_res.scalar_one_or_none() is not None:
+            return True
+        # If account already owns agent-side clients, keep switch enabled for testing.
+        client_res = await session.execute(select(Client.id).where(Client.agent_user_id == user.id).limit(1))
+        return client_res.scalar_one_or_none() is not None
+
+
 async def create_agent_invite(
     agent_tg_id: int,
     *,
@@ -184,7 +274,14 @@ async def get_agent_invite_by_token(token: str) -> AgentInvite | None:
         return res.scalar_one_or_none()
 
 
-async def consume_agent_invite(token: str, client_tg_id: int) -> tuple[bool, str]:
+async def consume_agent_invite(
+    token: str,
+    client_tg_id: int,
+    *,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    username: str | None = None,
+) -> tuple[bool, str]:
     """
     Placeholder consume flow:
     - validates token lifecycle,
@@ -221,6 +318,10 @@ async def consume_agent_invite(token: str, client_tg_id: int) -> tuple[bool, str
             if user.role is None:
                 user.role = UserRole.client
 
+        # One Telegram client should be bound to only one CRM card.
+        bound_res = await session.execute(select(Client).where(Client.source_user_id == user.id).limit(1))
+        already_bound = bound_res.scalar_one_or_none()
+
         # If invite targets a concrete CRM client, bind exactly this client record.
         if inv.target_client_id is not None:
             target_res = await session.execute(
@@ -234,6 +335,8 @@ async def consume_agent_invite(token: str, client_tg_id: int) -> tuple[bool, str
                 return False, "target_client_not_found"
             if target_client.source_user_id is not None and target_client.source_user_id != user.id:
                 return False, "target_client_already_bound"
+            if already_bound is not None and already_bound.id != target_client.id:
+                return False, "user_already_bound"
             target_client.source_user_id = user.id
         else:
             # Generic invite: ensure this invited user appears in agent's client base.
@@ -244,12 +347,14 @@ async def consume_agent_invite(token: str, client_tg_id: int) -> tuple[bool, str
                 ).limit(1)
             )
             existing_client = existing_client_res.scalar_one_or_none()
+            if already_bound is not None and existing_client is None:
+                return False, "user_already_bound"
             if existing_client is None:
                 session.add(
                     Client(
                         agent_user_id=inv.agent_user_id,
                         source_user_id=user.id,
-                        full_name=f"Клиент tg_id={user.tg_id}",
+                        full_name=_profile_display_name(first_name, last_name, username, user.tg_id),
                         phone=None,
                         email=None,
                     )
@@ -386,7 +491,14 @@ async def regenerate_public_agent_link(agent_tg_id: int) -> AgentInvite | None:
         return inv
 
 
-async def consume_public_agent_link(token: str, client_tg_id: int) -> tuple[bool, str]:
+async def consume_public_agent_link(
+    token: str,
+    client_tg_id: int,
+    *,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    username: str | None = None,
+) -> tuple[bool, str]:
     async with get_session_maker()() as session:
         inv_res = await session.execute(
             select(AgentInvite)
@@ -416,6 +528,9 @@ async def consume_public_agent_link(token: str, client_tg_id: int) -> tuple[bool
             if user.role is None:
                 user.role = UserRole.client
 
+        bound_res = await session.execute(select(Client).where(Client.source_user_id == user.id).limit(1))
+        already_bound = bound_res.scalar_one_or_none()
+
         existing_client_res = await session.execute(
             select(Client).where(
                 Client.agent_user_id == inv.agent_user_id,
@@ -423,12 +538,14 @@ async def consume_public_agent_link(token: str, client_tg_id: int) -> tuple[bool
             ).limit(1)
         )
         existing_client = existing_client_res.scalar_one_or_none()
+        if already_bound is not None and existing_client is None:
+            return False, "user_already_bound"
         if existing_client is None:
             session.add(
                 Client(
                     agent_user_id=inv.agent_user_id,
                     source_user_id=user.id,
-                    full_name=f"Клиент tg_id={user.tg_id}",
+                    full_name=_profile_display_name(first_name, last_name, username, user.tg_id),
                     phone=None,
                     email=None,
                 )
@@ -487,6 +604,119 @@ async def create_application_for_client(tg_id: int, description: str | None = No
         await session.commit()
         await session.refresh(app)
         return app
+
+
+async def list_tenant_agent_tg_ids_for_client(client_tg_id: int) -> list[int]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.tenant_id is None:
+            return []
+        res = await session.execute(
+            select(User.tg_id).where(
+                User.role == UserRole.agent,
+                User.tenant_id == user.tenant_id,
+            )
+        )
+        return [int(x) for x in res.scalars().all()]
+
+
+async def get_bound_client_profile(client_tg_id: int) -> tuple[str | None, str | None, str | None] | None:
+    pair = await get_bound_agent_and_client_for_user(client_tg_id)
+    if pair is None:
+        return None
+    _agent_tg_id, client_id = pair
+    async with get_session_maker()() as session:
+        c_res = await session.execute(select(Client).where(Client.id == client_id).limit(1))
+        c = c_res.scalar_one_or_none()
+        if c is None:
+            return None
+        return c.full_name, c.phone, c.email
+
+
+async def list_bound_client_tg_for_agent(agent_tg_id: int) -> list[tuple[int, str]]:
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return []
+        res = await session.execute(
+            select(User.tg_id, Client.full_name)
+            .join(Client, Client.source_user_id == User.id)
+            .where(
+                Client.agent_user_id == agent.id,
+                User.tenant_id == agent.tenant_id,
+            )
+        )
+        return [(int(tg), str(name or "")) for tg, name in res.all()]
+
+
+async def get_client_nearest_payment_or_contract_end(
+    client_tg_id: int,
+) -> tuple[str, dict] | None:
+    """
+    Returns:
+      ("payment", {...}) or ("no_payments", {...}) or None (no contracts).
+    """
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+
+        pay_res = await session.execute(
+            select(Payment, Contract)
+            .join(Contract, Contract.id == Payment.contract_id)
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+                Contract.status == ContractStatus.active,
+                Payment.status == PaymentStatus.pending,
+            )
+            .order_by(Payment.due_date.asc())
+            .limit(1)
+        )
+        row = pay_res.first()
+        if row is not None:
+            p, c = row
+            return (
+                "payment",
+                {
+                    "due_date": p.due_date,
+                    "company": c.company,
+                    "contract_number": c.contract_number,
+                    "contract_kind": c.contract_kind,
+                    "amount_minor": int(p.amount_minor),
+                    "currency": c.currency,
+                },
+            )
+
+        end_res = await session.execute(
+            select(Contract)
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+                Contract.status == ContractStatus.active,
+            )
+            .order_by(Contract.end_date.asc())
+            .limit(1)
+        )
+        ct = end_res.scalar_one_or_none()
+        if ct is None:
+            return None
+        return (
+            "no_payments",
+            {
+                "end_date": ct.end_date,
+                "company": ct.company,
+                "contract_number": ct.contract_number,
+                "contract_kind": ct.contract_kind,
+            },
+        )
 
 
 async def list_incoming_applications(agent_tg_id: int, limit: int = 20) -> list[Application]:
@@ -1299,6 +1529,431 @@ async def list_contracts_for_client(agent_tg_id: int, client_id: int, limit: int
             .limit(limit)
         )
         return list(res.scalars().all())
+
+
+async def list_contracts_for_client_user(client_tg_id: int, limit: int = 50) -> list[Contract]:
+    """
+    Contracts visible to Telegram client account bound via `clients.source_user_id`.
+    """
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        res = await session.execute(
+            select(Contract)
+            .options(selectinload(Contract.payments))
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .order_by(Contract.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def get_bound_agent_and_client_for_user(client_tg_id: int) -> tuple[int, int] | None:
+    """
+    Returns (agent_tg_id, client_id) for Telegram user bound via invite.
+    """
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        # Prefer explicit latest invite consumption (deterministic source of truth).
+        inv_res = await session.execute(
+            select(AgentInvite)
+            .where(
+                AgentInvite.used_by_user_id == user.id,
+                AgentInvite.tenant_id == user.tenant_id,
+            )
+            .order_by(AgentInvite.used_at.desc().nullslast(), AgentInvite.id.desc())
+            .limit(1)
+        )
+        inv = inv_res.scalar_one_or_none()
+        if inv is not None:
+            if inv.target_client_id is not None:
+                a_res = await session.execute(select(User.tg_id).where(User.id == inv.agent_user_id).limit(1))
+                a_tg = a_res.scalar_one_or_none()
+                if a_tg is not None:
+                    return int(a_tg), int(inv.target_client_id)
+            c_res = await session.execute(
+                select(Client.id, User.tg_id)
+                .join(User, User.id == Client.agent_user_id)
+                .where(
+                    Client.agent_user_id == inv.agent_user_id,
+                    Client.source_user_id == user.id,
+                    User.tenant_id == user.tenant_id,
+                )
+                .order_by(Client.created_at.desc())
+                .limit(1)
+            )
+            c_row = c_res.first()
+            if c_row is not None:
+                return int(c_row[1]), int(c_row[0])
+        # Fallback (legacy): latest bound client in tenant.
+        res = await session.execute(
+            select(User.tg_id, Client.id)
+            .join(Client, Client.agent_user_id == User.id)
+            .where(
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .order_by(Client.created_at.desc())
+            .limit(1)
+        )
+        row = res.first()
+        if row is None:
+            return None
+        return int(row[0]), int(row[1])
+
+
+async def get_bound_agent_contact_for_client(
+    client_tg_id: int,
+) -> tuple[int, str | None, list[str], str | None, str | None, int, str | None, str | None] | None:
+    """
+    Returns:
+      (agent_tg_id, agent_name, agent_phones, agent_email, agent_telegram, crm_client_id, crm_client_name, crm_client_phone)
+    """
+    pair = await get_bound_agent_and_client_for_user(client_tg_id)
+    if pair is None:
+        return None
+    agent_tg_id, client_id = pair
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id).limit(1))
+        agent = agent_res.scalar_one_or_none()
+        client_res = await session.execute(select(Client).where(Client.id == client_id).limit(1))
+        c = client_res.scalar_one_or_none()
+        if agent is None or c is None:
+            return None
+        phones: list[str] = []
+        if agent.agent_contact_phones_json:
+            try:
+                parsed = json.loads(agent.agent_contact_phones_json)
+                if isinstance(parsed, list):
+                    phones = [str(x).strip() for x in parsed if str(x).strip()]
+            except Exception:
+                phones = []
+        return (
+            int(agent.tg_id),
+            agent.display_name,
+            phones,
+            (agent.agent_contact_email or None),
+            (agent.agent_contact_telegram or None),
+            int(c.id),
+            c.full_name,
+            c.phone,
+        )
+
+
+async def update_bound_client_phone(client_tg_id: int, phone: str) -> bool:
+    p = (phone or "").strip()
+    if len(p) < 5:
+        return False
+    pair = await get_bound_agent_and_client_for_user(client_tg_id)
+    if pair is None:
+        return False
+    _agent_tg_id, client_id = pair
+    async with get_session_maker()() as session:
+        c_res = await session.execute(select(Client).where(Client.id == client_id).limit(1))
+        c = c_res.scalar_one_or_none()
+        if c is None:
+            return False
+        c.phone = p
+        await session.commit()
+        return True
+
+
+async def get_contract_bound_client_tg(agent_tg_id: int, contract_id: int) -> tuple[int, str] | None:
+    """
+    Returns (client_tg_id, client_full_name) for contract if CRM client is bound to Telegram user.
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None:
+            return None
+        res = await session.execute(
+            select(User.tg_id, Client.full_name)
+            .join(Client, Client.source_user_id == User.id)
+            .join(Contract, Contract.client_id == Client.id)
+            .where(
+                Contract.id == contract_id,
+                Client.agent_user_id == agent.id,
+                User.tenant_id == agent.tenant_id,
+            )
+            .limit(1)
+        )
+        row = res.first()
+        if row is None:
+            return None
+        return int(row[0]), str(row[1] or "")
+
+
+async def get_contract_for_client_user(client_tg_id: int, contract_id: int) -> Contract | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        res = await session.execute(
+            select(Contract)
+            .options(selectinload(Contract.payments))
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Contract.id == contract_id,
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .limit(1)
+        )
+        ct = res.scalar_one_or_none()
+        if ct is not None:
+            ct.payments.sort(key=lambda p: p.due_date)
+        return ct
+
+
+async def list_contract_documents_for_client_user(client_tg_id: int, contract_id: int, limit: int = 10) -> list[ContractDocument]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        res = await session.execute(
+            select(ContractDocument)
+            .join(Contract, Contract.id == ContractDocument.contract_id)
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                ContractDocument.contract_id == contract_id,
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .order_by(ContractDocument.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def get_contract_document_for_client_user(client_tg_id: int, doc_id: int) -> ContractDocument | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        res = await session.execute(
+            select(ContractDocument)
+            .join(Contract, Contract.id == ContractDocument.contract_id)
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                ContractDocument.id == doc_id,
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .limit(1)
+        )
+        return res.scalar_one_or_none()
+
+
+async def create_contract_document_for_client_user(
+    client_tg_id: int,
+    contract_id: int,
+    file_id: str,
+    file_unique_id: str | None,
+    caption: str | None,
+) -> ContractDocument | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        contract_res = await session.execute(
+            select(Contract)
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Contract.id == contract_id,
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .limit(1)
+        )
+        ct = contract_res.scalar_one_or_none()
+        if ct is None:
+            return None
+        doc = ContractDocument(
+            contract_id=ct.id,
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            caption=caption,
+        )
+        session.add(doc)
+        await session.commit()
+        await session.refresh(doc)
+        return doc
+
+
+async def list_client_documents_for_client_user(client_tg_id: int, limit: int = 20) -> list[ClientDocument]:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return []
+        res = await session.execute(
+            select(ClientDocument)
+            .join(Client, Client.id == ClientDocument.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .order_by(ClientDocument.created_at.desc())
+            .limit(limit)
+        )
+        return list(res.scalars().all())
+
+
+async def get_client_document_for_client_user(client_tg_id: int, doc_id: int) -> ClientDocument | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        res = await session.execute(
+            select(ClientDocument)
+            .join(Client, Client.id == ClientDocument.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                ClientDocument.id == doc_id,
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .limit(1)
+        )
+        return res.scalar_one_or_none()
+
+
+async def create_client_document_for_client_user(
+    client_tg_id: int,
+    file_id: str,
+    file_unique_id: str | None,
+    caption: str | None,
+) -> ClientDocument | None:
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+        client_res = await session.execute(
+            select(Client)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
+            .order_by(Client.created_at.desc())
+            .limit(1)
+        )
+        c = client_res.scalar_one_or_none()
+        if c is None:
+            return None
+        doc = ClientDocument(
+            client_id=c.id,
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            caption=caption,
+        )
+        session.add(doc)
+        await session.commit()
+        await session.refresh(doc)
+        return doc
+
+
+async def report_client_payment_with_adjustment(
+    client_tg_id: int,
+    contract_id: int,
+    paid_date: date,
+    amount_minor: int,
+) -> tuple[int, str, int] | None:
+    """
+    Client reports payment via bot.
+    Returns (agent_tg_id, contract_number, pending_left_count) on success.
+    """
+    if amount_minor <= 0:
+        return None
+    async with get_session_maker()() as session:
+        user_res = await session.execute(select(User).where(User.tg_id == client_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None:
+            return None
+
+        res = await session.execute(
+            select(Contract, Client, User)
+            .options(selectinload(Contract.payments))
+            .join(Client, Client.id == Contract.client_id)
+            .join(User, User.id == Client.agent_user_id)
+            .where(
+                Contract.id == contract_id,
+                Client.source_user_id == user.id,
+                User.tenant_id == user.tenant_id,
+                Contract.status == ContractStatus.active,
+            )
+            .limit(1)
+        )
+        row = res.first()
+        if row is None:
+            return None
+        ct, _crm_client, agent = row
+        pending = sorted([p for p in ct.payments if p.status == PaymentStatus.pending], key=lambda p: p.due_date)
+        if not pending:
+            return None
+
+        # First pending installment is considered paid.
+        first_pending = pending[0]
+        first_amount = int(first_pending.amount_minor)
+        first_pending.status = PaymentStatus.paid
+        first_pending.paid_at = datetime.combine(paid_date, datetime.min.time(), tzinfo=timezone.utc)
+        delta = int(amount_minor) - first_amount
+
+        # Adjust tail installments so schedule remains consistent with reported amount.
+        tail = sorted([p for p in pending[1:] if p.status == PaymentStatus.pending], key=lambda p: p.due_date, reverse=True)
+        if delta > 0 and tail:
+            remaining = delta
+            for p in tail:
+                if remaining <= 0:
+                    break
+                take = min(int(p.amount_minor), remaining)
+                p.amount_minor = int(p.amount_minor) - take
+                remaining -= take
+                if p.amount_minor <= 0:
+                    await session.delete(p)
+        elif delta < 0:
+            debt = -delta
+            if tail:
+                tail[0].amount_minor = int(tail[0].amount_minor) + debt
+            else:
+                session.add(
+                    Payment(
+                        contract_id=ct.id,
+                        amount_minor=debt,
+                        due_date=ct.end_date,
+                        status=PaymentStatus.pending,
+                    )
+                )
+
+        await session.commit()
+        # Recount pending.
+        pending_count_res = await session.execute(
+            select(func.count(Payment.id)).where(Payment.contract_id == ct.id, Payment.status == PaymentStatus.pending)
+        )
+        pending_left = int(pending_count_res.scalar() or 0)
+        return int(agent.tg_id), str(ct.contract_number), pending_left
 
 
 async def get_contract_detailed(agent_tg_id: int, contract_id: int) -> Contract | None:

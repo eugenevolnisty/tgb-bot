@@ -475,23 +475,41 @@ async def send_client_payment_reminder_sweep(bot: Bot) -> None:
         for (user_id, user_tg_id), p_rows in by_client_user.items():
             if await _marker_exists(session, user_id, marker_text):
                 continue
-            due_1 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=1)]
-            due_3 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=3)]
             due_7 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=7)]
             if not due_7:
                 await _create_sent_marker(session, user_id, marker_text)
                 continue
-
-            text = (
-                "⏰ Напоминание о взносах\n"
-                f"{today:%d.%m}—{(today + timedelta(days=1)):%d.%m}: {len(due_1)}\n"
-                f"{today:%d.%m}—{(today + timedelta(days=3)):%d.%m}: {len(due_3)}\n"
-                f"{today:%d.%m}—{(today + timedelta(days=7)):%d.%m}: {len(due_7)}\n\n"
-                "Ближайшие платежи:\n"
-                + "\n".join(_build_client_payment_lines(due_7, limit=8))
-            )
+            unique_rows: dict[tuple[int, date, int], PaymentRow] = {}
+            for p in due_7:
+                unique_rows[(p.contract_id, p.due_date, p.amount_minor)] = p
+            compact = sorted(unique_rows.values(), key=lambda p: (p.due_date, p.contract_id))
+            lines = ["⏰ Напоминание о взносах", "Ближайшие платежи:"]
+            for p in compact[:10]:
+                lines.append(
+                    f"• {p.due_date:%d.%m.%Y} | номер договора {p.contract_number} | "
+                    f"{p.contract_company} | {p.contract_kind} | {_fmt_money(p.amount, p.currency)}"
+                )
+            if len(compact) > 10:
+                lines.append(f"… и ещё {len(compact) - 10} взносов")
+            # Add direct "I paid" buttons by contract.
+            seen_contracts: set[int] = set()
+            kb_rows: list[list[InlineKeyboardButton]] = []
+            for p in compact:
+                if p.contract_id in seen_contracts:
+                    continue
+                seen_contracts.add(p.contract_id)
+                kb_rows.append(
+                    [InlineKeyboardButton(text=f"📨 Я платил(а) по {p.contract_number}", callback_data=f"clpay:start:{p.contract_id}")]
+                )
+                if len(kb_rows) >= 5:
+                    break
+            text = "\n".join(lines)
             try:
-                await bot.send_message(user_tg_id, text)
+                await bot.send_message(
+                    user_tg_id,
+                    text,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None,
+                )
             except Exception as send_err:
                 log.warning("Failed to send client payment reminder to tg_id=%s: %s", user_tg_id, send_err)
             await _create_sent_marker(session, user_id, marker_text)
@@ -762,6 +780,13 @@ async def payment_reminders_worker(bot: Bot, *, run_hour: int = 9, run_minute: i
     except ZoneInfoNotFoundError:
         log.warning("Timezone %r not found, falling back to UTC. Install tzdata on Windows.", settings.timezone)
         tz = ZoneInfo("UTC")
+
+    # Immediate run at startup so reminders are testable without waiting for next morning window.
+    try:
+        await send_payment_reminder_sweep(bot)
+        await send_client_payment_reminder_sweep(bot)
+    except Exception as e:
+        log.exception("Payment reminder startup sweep error: %s", e)
 
     while True:
         try:

@@ -24,6 +24,7 @@ from bot.db.repo import (
     get_client_document,
     get_contract_document,
     get_contract_detailed,
+    get_contract_bound_client_tg,
     list_clients,
     list_clients_page,
     list_invited_client_user_ids,
@@ -1104,13 +1105,14 @@ async def contract_step_start_date(message: Message, state: FSMContext) -> None:
     # For all other types end date is automatically start + 1 year.
     end_date = _add_months(res.target_date, 12) - timedelta(days=1)
     await state.update_data(end_date_iso=end_date.isoformat())
-    await state.set_state(ContractAdd.total_amount)
+    await state.set_state(ContractAdd.insured_sum)
     currency = str(data.get("currency") or "BYN")
     await _flow_answer(
         message,
         "contract_add",
         f"Дата окончания рассчитана автоматически: {end_date:%d.%m.%Y}\n"
-        f"Страховой взнос (годовой, {currency}), число. Например: 1500.50"
+        f"Страховая сумма / лимит ответственности ({currency}), число. Например: 20000\n"
+        f"(Страховая сумма — лимит покрытия, страховой взнос — стоимость полиса.)"
     )
 
 
@@ -1142,10 +1144,15 @@ async def contract_step_end_date(message: Message, state: FSMContext) -> None:
         await _flow_answer(message, "contract_add", "Не понял дату. Пример: 20.03.2026")
         return
     await state.update_data(end_date_iso=res.target_date.isoformat())
-    await state.set_state(ContractAdd.total_amount)
+    await state.set_state(ContractAdd.insured_sum)
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
-    await _flow_answer(message, "contract_add", f"Страховой взнос (годовой, {currency}), число. Например: 1500.50")
+    await _flow_answer(
+        message,
+        "contract_add",
+        f"Страховая сумма / лимит ответственности ({currency}), число. Например: 20000\n"
+        f"(Страховая сумма — лимит покрытия, страховой взнос — стоимость полиса.)",
+    )
 
 
 def _add_months(src: date, months: int) -> date:
@@ -1271,24 +1278,6 @@ async def contract_step_total_amount(message: Message, state: FSMContext) -> Non
     data = await state.get_data()
     currency = str(data.get("currency") or "BYN")
     await state.update_data(total_amount_minor=int(round(val * 100)), currency=currency)
-    await state.set_state(ContractAdd.insured_sum)
-    await _flow_answer(message, "contract_add", f"Страховая сумма ({currency}), число. Например: 20000")
-
-
-@router.message(ContractAdd.insured_sum)
-async def contract_step_insured_sum(message: Message, state: FSMContext) -> None:
-    if not await _ensure_agent(message):
-        return
-    txt = (message.text or "").strip().replace(" ", "").replace(",", ".")
-    try:
-        val = float(txt)
-    except ValueError:
-        await message.answer("Страховая сумма должна быть числом. Например: 20000")
-        return
-    if val <= 0:
-        await message.answer("Страховая сумма должна быть больше 0.")
-        return
-    await state.update_data(insured_sum_minor=int(round(val * 100)))
     await state.set_state(ContractAdd.payment_plan)
     await message.answer(
         "Выбери график оплаты:",
@@ -1300,6 +1289,31 @@ async def contract_step_insured_sum(message: Message, state: FSMContext) -> None
                 [InlineKeyboardButton(text="В 12 этапов", callback_data="client:plan:12")],
             ]
         ),
+    )
+
+
+@router.message(ContractAdd.insured_sum)
+async def contract_step_insured_sum(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        val = float(txt)
+    except ValueError:
+        await message.answer("Страховая сумма (лимит ответственности) должна быть числом. Например: 20000")
+        return
+    if val <= 0:
+        await message.answer("Страховая сумма (лимит ответственности) должна быть больше 0.")
+        return
+    await state.update_data(insured_sum_minor=int(round(val * 100)))
+    data = await state.get_data()
+    currency = str(data.get("currency") or "BYN")
+    await state.set_state(ContractAdd.total_amount)
+    await _flow_answer(
+        message,
+        "contract_add",
+        f"Страховой взнос (годовой, {currency}), число. Например: 1500.50\n"
+        f"(Это стоимость полиса, которую клиент оплачивает по графику.)",
     )
 
 
@@ -1564,6 +1578,11 @@ async def _build_contract_view_text(
         if pending_exists
         else []
     )
+    notify_rows = (
+        [[InlineKeyboardButton(text="📨 Напомнить клиенту", callback_data=f"contract:notify_client:{ct.id}")]]
+        if pending_exists
+        else []
+    )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1572,6 +1591,7 @@ async def _build_contract_view_text(
             [InlineKeyboardButton(text="📎 Добавить фото договора", callback_data=f"contract:add_doc:{ct.id}")],
             *terminate_rows,
             *mark_rows,
+            *notify_rows,
             [InlineKeyboardButton(text="🗑 Удалить договор", callback_data=f"contract:delete:{ct.id}")],
         ]
     )
@@ -1654,6 +1674,11 @@ async def view_contract(callback: CallbackQuery) -> None:
         if pending_exists
         else []
     )
+    notify_rows = (
+        [[InlineKeyboardButton(text="📨 Напомнить клиенту", callback_data=f"contract:notify_client:{ct.id}")]]
+        if pending_exists
+        else []
+    )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1662,6 +1687,7 @@ async def view_contract(callback: CallbackQuery) -> None:
             [InlineKeyboardButton(text="📎 Добавить фото договора", callback_data=f"contract:add_doc:{ct.id}")],
             *terminate_rows,
             *mark_rows,
+            *notify_rows,
             [InlineKeyboardButton(text="🗑 Удалить договор", callback_data=f"contract:delete:{ct.id}")],
         ]
     )
@@ -1701,6 +1727,52 @@ async def view_contract(callback: CallbackQuery) -> None:
 
     await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("contract:notify_client:"))
+async def notify_client_from_contract(callback: CallbackQuery) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        contract_id = int(callback.data.split(":", 2)[2])
+    except Exception:
+        await callback.answer("Некорректный ID", show_alert=True)
+        return
+    ct = await get_contract_detailed(callback.from_user.id, contract_id)
+    if ct is None:
+        await callback.answer("Договор не найден", show_alert=True)
+        return
+    tgt = await get_contract_bound_client_tg(callback.from_user.id, contract_id)
+    if tgt is None:
+        await callback.answer("Клиент не привязан к Telegram", show_alert=True)
+        return
+    client_tg_id, _client_name = tgt
+    pending = [p for p in ct.payments if p.status == PaymentStatus.pending]
+    if not pending:
+        await callback.answer("Нет ожидающих взносов", show_alert=True)
+        return
+    pending_sorted = sorted(pending, key=lambda p: p.due_date)
+    lines = [
+        "⏰ Напоминание по договору",
+        f"Номер: {ct.contract_number}",
+        f"Компания: {ct.company}",
+        "",
+        "Ближайшие взносы:",
+    ]
+    for p in pending_sorted[:5]:
+        lines.append(f"• {p.due_date:%d.%m.%Y}: {p.amount_minor/100:.2f} {ct.currency}")
+    if len(pending_sorted) > 5:
+        lines.append(f"… и ещё {len(pending_sorted) - 5} взносов")
+    try:
+        await callback.bot.send_message(client_tg_id, "\n".join(lines))
+    except Exception:
+        await callback.answer("Не удалось отправить сообщение клиенту", show_alert=True)
+        return
+    await callback.answer("Уведомление отправлено")
 
 
 @router.callback_query(F.data.startswith("client:add_doc:"))

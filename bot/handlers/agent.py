@@ -19,8 +19,10 @@ from bot.db.repo import (
     delete_note_for_agent,
     delete_application,
     get_note_for_agent,
+    get_user_display_name,
     get_or_create_public_agent_link,
     get_or_create_user,
+    get_agent_contacts,
     list_incoming_applications,
     list_in_progress_applications,
     list_invited_client_user_ids,
@@ -30,10 +32,13 @@ from bot.db.repo import (
     list_agent_invites,
     list_agent_companies_for_commission,
     list_agent_contract_kinds_for_company,
+    list_bound_client_tg_for_agent,
     revoke_agent_invite,
     regenerate_public_agent_link,
     upsert_agent_commission,
     set_agent_password,
+    set_agent_display_name,
+    set_agent_contacts,
     set_application_status,
 )
 from bot.keyboards import Btn, agent_menu, application_actions_keyboard
@@ -60,6 +65,18 @@ class AgentCommissionSetup(StatesGroup):
 
 class AgentAuthSetup(StatesGroup):
     password = State()
+
+
+class AgentProfileSetup(StatesGroup):
+    name = State()
+    contacts_phones = State()
+    contacts_telegram = State()
+    contacts_email = State()
+
+
+class AgentBroadcast(StatesGroup):
+    text = State()
+    confirm = State()
 
 
 def _safe_delete_text(text: str | None) -> str:
@@ -130,9 +147,12 @@ def _settings_root_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="💼 Комиссия", callback_data="aset:commission")],
             [InlineKeyboardButton(text="🔐 Доступ агента", callback_data="aset:auth")],
+            [InlineKeyboardButton(text="👤 Имя агента", callback_data="aset:profile_name")],
+            [InlineKeyboardButton(text="☎️ Контакты агента", callback_data="aset:contacts")],
             [InlineKeyboardButton(text="🔗 Пригласить клиента", callback_data="aset:invite:create")],
             [InlineKeyboardButton(text="🌐 Публичная ссылка", callback_data="aset:public_link")],
             [InlineKeyboardButton(text="📎 Мои инвайты", callback_data="aset:invite:list")],
+            [InlineKeyboardButton(text="📣 Сообщение всем клиентам", callback_data="aset:broadcast")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="aset:back")],
         ]
     )
@@ -888,7 +908,9 @@ async def agent_reports_back(callback: CallbackQuery) -> None:
 async def agent_settings(message: Message) -> None:
     if not await _ensure_agent(message):
         return
-    await message.answer("⚙️ Настройки:", reply_markup=_settings_root_keyboard())
+    current_name = await get_user_display_name(message.from_user.id)
+    name_line = f"\nТекущее имя агента: {current_name}" if current_name else "\nТекущее имя агента: не задано"
+    await message.answer(f"⚙️ Настройки:{name_line}", reply_markup=_settings_root_keyboard())
 
 
 @router.callback_query(F.data == "aset:root")
@@ -896,7 +918,9 @@ async def settings_root(callback: CallbackQuery) -> None:
     if not await _ensure_agent_tg(callback.from_user.id):
         await callback.answer("Недоступно", show_alert=True)
         return
-    await callback.message.answer("⚙️ Настройки:", reply_markup=_settings_root_keyboard())
+    current_name = await get_user_display_name(callback.from_user.id)
+    name_line = f"\nТекущее имя агента: {current_name}" if current_name else "\nТекущее имя агента: не задано"
+    await callback.message.answer(f"⚙️ Настройки:{name_line}", reply_markup=_settings_root_keyboard())
     await callback.answer()
 
 
@@ -918,6 +942,173 @@ async def settings_auth(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AgentAuthSetup.password)
     await callback.message.answer("Введите новый пароль агента (минимум 6 символов):")
     await callback.answer()
+
+
+@router.callback_query(F.data == "aset:profile_name")
+async def settings_profile_name(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    current_name = await get_user_display_name(callback.from_user.id)
+    await state.clear()
+    await state.set_state(AgentProfileSetup.name)
+    current_line = f"Текущее имя: {current_name}\n" if current_name else ""
+    await callback.message.answer(f"{current_line}Введите имя агента (как будет видно клиентам):")
+    await callback.answer()
+
+
+@router.message(AgentProfileSetup.name)
+async def settings_profile_name_save(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.answer("Слишком коротко. Введите имя агента (минимум 2 символа).")
+        return
+    ok = await set_agent_display_name(message.from_user.id, name)
+    await state.clear()
+    if not ok:
+        await message.answer("Не удалось сохранить имя агента.", reply_markup=agent_menu())
+        return
+    await message.answer(f"✅ Имя агента сохранено: {name}", reply_markup=agent_menu())
+
+
+@router.callback_query(F.data == "aset:contacts")
+async def settings_contacts_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    phones, email, telegram = await get_agent_contacts(callback.from_user.id)
+    await state.clear()
+    await state.set_state(AgentProfileSetup.contacts_phones)
+    phones_line = ", ".join(phones) if phones else "—"
+    telegram_line = f"@{telegram}" if telegram else "—"
+    await callback.message.answer(
+        f"Текущие телефоны: {phones_line}\n"
+        f"Текущий Telegram: {telegram_line}\n"
+        f"Текущий email: {email or '—'}\n\n"
+        "Введите телефоны через запятую (или 'нет'):"
+    )
+    await callback.answer()
+
+
+@router.message(AgentProfileSetup.contacts_phones)
+async def settings_contacts_phones(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip()
+    phones = [] if txt.lower() == "нет" else [x.strip() for x in txt.split(",") if x.strip()]
+    await state.update_data(agent_contacts_phones=phones)
+    await state.set_state(AgentProfileSetup.contacts_telegram)
+    await message.answer("Введите Telegram аккаунт агента (username, можно с @) или 'нет':")
+
+
+@router.message(AgentProfileSetup.contacts_telegram)
+async def settings_contacts_telegram(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip()
+    telegram = None if txt.lower() == "нет" else txt
+    await state.update_data(agent_contacts_telegram=telegram)
+    await state.set_state(AgentProfileSetup.contacts_email)
+    await message.answer("Введите email агента (или 'нет'):")
+
+
+@router.message(AgentProfileSetup.contacts_email)
+async def settings_contacts_email(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip()
+    email = None if txt.lower() == "нет" else txt
+    data = await state.get_data()
+    phones = list(data.get("agent_contacts_phones") or [])
+    telegram = data.get("agent_contacts_telegram")
+    ok = await set_agent_contacts(message.from_user.id, phones, email, telegram)
+    await state.clear()
+    if not ok:
+        await message.answer("Не удалось сохранить контакты.", reply_markup=agent_menu())
+        return
+    await message.answer("✅ Контакты агента сохранены.", reply_markup=agent_menu())
+
+
+@router.callback_query(F.data == "aset:broadcast")
+async def settings_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AgentBroadcast.text)
+    await callback.message.answer("Введите текст сообщения для рассылки всем привязанным клиентам:")
+    await callback.answer()
+
+
+@router.message(AgentBroadcast.text)
+async def settings_broadcast_send(message: Message, state: FSMContext) -> None:
+    if not await _ensure_agent(message):
+        return
+    txt = (message.text or "").strip()
+    if len(txt) < 2:
+        await message.answer("Текст слишком короткий.")
+        return
+    targets = await list_bound_client_tg_for_agent(message.from_user.id)
+    if not targets:
+        await state.clear()
+        await message.answer("Нет привязанных клиентов для рассылки.", reply_markup=agent_menu())
+        return
+    await state.update_data(agent_broadcast_text=txt)
+    await state.set_state(AgentBroadcast.confirm)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отправить", callback_data="aset:broadcast:send")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="aset:broadcast:cancel")],
+        ]
+    )
+    await message.answer(
+        f"Предпросмотр рассылки ({len(targets)} клиентов):\n\n📣 Сообщение от агента:\n{txt}",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "aset:broadcast:cancel")
+async def settings_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if callback.message is not None:
+        await callback.message.answer("Рассылка отменена.", reply_markup=agent_menu())
+    await callback.answer("Отменено")
+
+
+@router.callback_query(F.data == "aset:broadcast:send")
+async def settings_broadcast_confirm_send(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message is None:
+        await callback.answer()
+        return
+    if not await _ensure_agent_tg(callback.from_user.id):
+        await state.clear()
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    data = await state.get_data()
+    txt = str(data.get("agent_broadcast_text") or "").strip()
+    if len(txt) < 2:
+        await state.clear()
+        await callback.message.answer("Текст рассылки потерян. Запустите заново.", reply_markup=agent_menu())
+        await callback.answer()
+        return
+    targets = await list_bound_client_tg_for_agent(callback.from_user.id)
+    if not targets:
+        await state.clear()
+        await callback.message.answer("Нет привязанных клиентов для рассылки.", reply_markup=agent_menu())
+        await callback.answer()
+        return
+    sent = 0
+    for tg_id, _name in targets:
+        try:
+            await callback.bot.send_message(tg_id, f"📣 Сообщение от агента:\n{txt}")
+            sent += 1
+        except Exception:
+            pass
+    await state.clear()
+    await callback.message.answer(f"✅ Рассылка отправлена: {sent} из {len(targets)}.", reply_markup=agent_menu())
+    await callback.answer("Отправлено")
 
 
 @router.callback_query(F.data == "aset:invite:create")

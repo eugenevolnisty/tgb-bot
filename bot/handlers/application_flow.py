@@ -3,10 +3,10 @@ from __future__ import annotations
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.db.models import UserRole
-from bot.db.repo import create_application_for_client, get_or_create_user
+from bot.db.repo import create_application_for_client, get_bound_client_profile, get_or_create_user, list_tenant_agent_tg_ids_for_client
 from bot.keyboards import Btn, client_menu, insurance_type_keyboard, to_main_menu_keyboard
 
 router = Router()
@@ -194,6 +194,41 @@ async def step_contact(message: Message, state: FSMContext) -> None:
 
     title = f"Заявка — {insurance_type}"
     app = await create_application_for_client(message.from_user.id, description="\n".join(description_lines))
+
+    # Notify tenant agents immediately with enriched client profile.
+    profile = await get_bound_client_profile(message.from_user.id)
+    profile_lines: list[str] = []
+    if profile is not None:
+        n, ph, em = profile
+        profile_lines.append("Данные клиента из базы агента:")
+        profile_lines.append(f"- Имя: {n or '—'}")
+        profile_lines.append(f"- Телефон: {ph or '—'}")
+        profile_lines.append(f"- Email: {em or '—'}")
+        profile_lines.append("")
+    notify_text = (
+        f"📌 Заявка №{app.id}\n"
+        f"👤 Клиент: tg_id={message.from_user.id}\n"
+        f"📎 Статус: new\n\n"
+        + "\n".join(profile_lines)
+        + "\n".join(description_lines)
+    )
+    agent_tg_ids = await list_tenant_agent_tg_ids_for_client(message.from_user.id)
+    for agent_tg_id in agent_tg_ids:
+        try:
+            await message.bot.send_message(
+                agent_tg_id,
+                notify_text,
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"app:take:{app.id}"),
+                            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"app:delete:{app.id}"),
+                        ]
+                    ]
+                ),
+            )
+        except Exception:
+            pass
 
     await state.clear()
     await message.answer(f"✅ Заявка №{app.id} создана и отправлена агенту.", reply_markup=client_menu())
