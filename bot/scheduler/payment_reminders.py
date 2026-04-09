@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.config import get_settings
 from bot.db.base import get_session_maker
@@ -579,6 +579,11 @@ def _build_payment_lines(payments: list[PaymentRow], limit: int = 20) -> list[st
 
 
 async def send_payment_reminder_sweep(bot: Bot) -> None:
+    """
+    Утренний отчёт: одно сообщение-дайджест.
+    Включает: просроченные + ближайшие 14 дней + заканчивающиеся договоры.
+    Кнопки позволяют запросить детальный xlsx.
+    """
     settings = get_settings()
     try:
         tz = ZoneInfo(settings.timezone)
@@ -588,22 +593,17 @@ async def send_payment_reminder_sweep(bot: Bot) -> None:
 
     local_now = datetime.now(tz)
     today = local_now.date()
-
-    # Marker is per local day and per agent.
     marker_text = f"{_MARKER_PREFIX}{today.isoformat()}"
-
-    # Fetch payments up to end of month window for lists.
-    due_end = today + timedelta(days=29)
+    end_14 = today + timedelta(days=14)
 
     async with get_session_maker()() as session:
         agents = await _fetch_agents(session)
         if not agents:
             return
 
-        payments_all = await _fetch_payments_due_up_to(session, due_end=due_end)
+        payments_all = await _fetch_payments_due_up_to(session, due_end=end_14)
         contracts_ends = await _fetch_contract_ends_for_deltas(session, deltas=[30, 14, 7], today=today)
 
-        # Group payments by agent tg_id.
         payments_by_agent: dict[int, list[PaymentRow]] = defaultdict(list)
         for payment, contract, client, agent_user in payments_all:
             payments_by_agent[agent_user.tg_id].append(
@@ -621,12 +621,10 @@ async def send_payment_reminder_sweep(bot: Bot) -> None:
                 )
             )
 
-        # Group contract ends by agent tg_id.
         contract_ends_by_agent: dict[int, list[tuple[Contract, int]]] = defaultdict(list)
         for contract, agent_user, pending_count in contracts_ends:
             contract_ends_by_agent[agent_user.tg_id].append((contract, pending_count))
 
-        # Send per agent.
         for agent in agents:
             agent_tg_id = agent.tg_id
             agent_user_id = agent.id
@@ -634,135 +632,78 @@ async def send_payment_reminder_sweep(bot: Bot) -> None:
             if await _marker_exists(session, agent_user_id, marker_text):
                 continue
 
-            # Get payments for this agent (might be empty).
             p_rows = payments_by_agent.get(agent_tg_id, [])
-
-            # Split dates for +1/+3/+7 reports (inclusive window [today, today+N]) and other buckets.
-            overdue = [p for p in p_rows if p.due_date < today]
-            due_1 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=1)]
-            due_3 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=3)]
-            due_7 = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=7)]
-
-            week = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=6)]
-            month = [p for p in p_rows if today <= p.due_date <= today + timedelta(days=29)]
-
-            # Contract end notifications.
             ends_rows = contract_ends_by_agent.get(agent_tg_id, [])
-            ends_30 = [c for c, _cnt in ends_rows if c.end_date == today + timedelta(days=30)]
-            ends_14 = [c for c, _cnt in ends_rows if c.end_date == today + timedelta(days=14)]
-            ends_7 = [c for c, _cnt in ends_rows if c.end_date == today + timedelta(days=7)]
 
-            # Build and send messages only if there is something to report.
-            any_sent = False
+            overdue = [p for p in p_rows if p.due_date < today]
+            upcoming = [p for p in p_rows if today <= p.due_date <= end_14]
+
+            seen: set[tuple[int, date, int]] = set()
+            unique_upcoming: list[PaymentRow] = []
+            for p in upcoming:
+                key = (p.contract_id, p.due_date, p.amount_minor)
+                if key not in seen:
+                    seen.add(key)
+                    unique_upcoming.append(p)
+
+            ends_30 = [c for c, _ in ends_rows if c.end_date == today + timedelta(days=30)]
+            ends_14 = [c for c, _ in ends_rows if c.end_date == today + timedelta(days=14)]
+            ends_7 = [c for c, _ in ends_rows if c.end_date == today + timedelta(days=7)]
+
+            lines: list[str] = [f"🌅 Доброе утро! Сводка на {today:%d.%m.%Y}"]
 
             if overdue:
-                any_sent = True
-                lines = _build_payment_lines(overdue)
-                text = "⛔ Просроченные платежи\n" + "\n".join(lines)
-                await bot.send_message(agent_tg_id, text)
+                total_str = _payments_totals_by_currency(overdue)
+                lines.append(f"\n⛔ Просроченные: {len(overdue)} ({total_str})")
+                for p in overdue[:5]:
+                    lines.append(
+                        f"  • {p.client_name} | {p.contract_number} | {p.due_date:%d.%m} | "
+                        f"{_fmt_money(p.amount, p.currency)}"
+                    )
+                if len(overdue) > 5:
+                    lines.append(f"  … и ещё {len(overdue) - 5}")
 
-            # 1/3/7 daily button reports:
-            # Requirement: 3 different buttons, each sends one report.
-            # Also: every morning auto-send these three reports.
-            due_1_count, due_3_count, due_7_count = len(due_1), len(due_3), len(due_7)
-            any_sent = True
+            if unique_upcoming:
+                total_str = _payments_totals_by_currency(unique_upcoming)
+                lines.append(f"\n📅 Ближайшие 14 дней: {len(unique_upcoming)} взносов ({total_str})")
+                for p in unique_upcoming[:7]:
+                    lines.append(
+                        f"  • {p.due_date:%d.%m} | {p.client_name} | {p.contract_number} | "
+                        f"{_fmt_money(p.amount, p.currency)}"
+                    )
+                if len(unique_upcoming) > 7:
+                    lines.append(f"  … и ещё {len(unique_upcoming) - 7}")
+            else:
+                lines.append("\n✅ Взносов на 14 дней вперёд нет")
 
-            end_1, end_3, end_7 = today + timedelta(days=1), today + timedelta(days=3), today + timedelta(days=7)
-            summary_text = (
-                f"⏰ Сводка по взносам\n"
-                f"{today:%d.%m}—{end_1:%d.%m}: {due_1_count} взносов, {_payments_totals_by_currency(due_1)}\n"
-                f"{today:%d.%m}—{end_3:%d.%m}: {due_3_count} взносов, {_payments_totals_by_currency(due_3)}\n"
-                f"{today:%d.%m}—{end_7:%d.%m}: {due_7_count} взносов, {_payments_totals_by_currency(due_7)}"
-            )
+            if ends_7 or ends_14 or ends_30:
+                lines.append("\n📋 Заканчиваются договоры:")
+                for c in ends_7:
+                    lines.append(f"  • ⚠️ через 7 дн: {c.contract_number}")
+                for c in ends_14:
+                    lines.append(f"  • через 14 дн: {c.contract_number}")
+                for c in ends_30:
+                    lines.append(f"  • через 30 дн: {c.contract_number}")
+
+            text = "\n".join(lines)
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="+1 день", callback_data="payrep:1"),
-                        InlineKeyboardButton(text="+3 дня", callback_data="payrep:3"),
-                        InlineKeyboardButton(text="+7 дней", callback_data="payrep:7"),
+                        InlineKeyboardButton(text="📥 Взносы на 7 дней", callback_data="payrep:7"),
+                        InlineKeyboardButton(text="📥 На 14 дней", callback_data="payrep:14"),
                     ],
                     [
-                        InlineKeyboardButton(text="30 дней", callback_data="payrep:range:30"),
+                        InlineKeyboardButton(text="📥 На 30 дней", callback_data="payrep:range:30"),
+                        InlineKeyboardButton(text="📋 Договоры", callback_data="contrep:14"),
                     ],
                 ]
             )
-            await bot.send_message(agent_tg_id, summary_text, reply_markup=kb)
 
-            # Auto export 3 detailed reports as files for reliability.
-            if due_1:
-                fn, payload = _payments_period_to_xlsx_bytes(due_1, date_from=today, date_to=end_1)
-                await bot.send_document(
-                    agent_tg_id,
-                    BufferedInputFile(payload, filename=fn),
-                    caption=(
-                        f"⏳ Период {today:%d.%m.%Y}—{end_1:%d.%m.%Y}. "
-                        f"Всего: {due_1_count} взносов, {_payments_totals_by_currency(due_1)}"
-                    ),
-                )
-            else:
-                await bot.send_message(
-                    agent_tg_id,
-                    f"⏳ Период {today:%d.%m.%Y}—{end_1:%d.%m.%Y}: нет ожидающих взносов.",
-                )
+            try:
+                await bot.send_message(agent_tg_id, text, reply_markup=kb)
+            except Exception as e:
+                log.warning("Failed to send morning sweep to agent %s: %s", agent_tg_id, e)
 
-            if due_3:
-                fn, payload = _payments_period_to_xlsx_bytes(due_3, date_from=today, date_to=end_3)
-                await bot.send_document(
-                    agent_tg_id,
-                    BufferedInputFile(payload, filename=fn),
-                    caption=(
-                        f"⏳ Период {today:%d.%m.%Y}—{end_3:%d.%m.%Y}. "
-                        f"Всего: {due_3_count} взносов, {_payments_totals_by_currency(due_3)}"
-                    ),
-                )
-            else:
-                await bot.send_message(
-                    agent_tg_id,
-                    f"⏳ Период {today:%d.%m.%Y}—{end_3:%d.%m.%Y}: нет ожидающих взносов.",
-                )
-
-            if due_7:
-                fn, payload = _payments_period_to_xlsx_bytes(due_7, date_from=today, date_to=end_7)
-                await bot.send_document(
-                    agent_tg_id,
-                    BufferedInputFile(payload, filename=fn),
-                    caption=(
-                        f"⏳ Период {today:%d.%m.%Y}—{end_7:%d.%m.%Y}. "
-                        f"Всего: {due_7_count} взносов, {_payments_totals_by_currency(due_7)}"
-                    ),
-                )
-            else:
-                await bot.send_message(
-                    agent_tg_id,
-                    f"⏳ Период {today:%d.%m.%Y}—{end_7:%d.%m.%Y}: нет ожидающих взносов.",
-                )
-
-            if ends_rows and (ends_30 or ends_14 or ends_7):
-                any_sent = True
-                text_parts = ["📅 До конца договора с pending платежами:"]
-                if ends_30:
-                    text_parts.append(f"• через 30 дней: {len(ends_30)} договор(ов)")
-                if ends_14:
-                    text_parts.append(f"• через 14 дней: {len(ends_14)} договор(ов)")
-                if ends_7:
-                    text_parts.append(f"• через 7 дней: {len(ends_7)} договор(ов)")
-                await bot.send_message(agent_tg_id, "\n".join(text_parts))
-
-            if week:
-                any_sent = True
-                end_week = today + timedelta(days=6)
-                text = f"📋 Список платежей на неделю до {end_week:%d.%m.%Y}\n"
-                text += "\n".join(_build_payment_lines(week, limit=15))
-                await bot.send_message(agent_tg_id, text)
-
-            if month:
-                any_sent = True
-                end_month = today + timedelta(days=29)
-                text = f"📋 Список платежей на месяц до {end_month:%d.%m.%Y}\n"
-                text += "\n".join(_build_payment_lines(month, limit=20))
-                await bot.send_message(agent_tg_id, text)
-
-            # Mark sweep done for this agent even if there was nothing.
             await _create_sent_marker(session, agent_user_id, marker_text)
 
         await session.commit()

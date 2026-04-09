@@ -1,7 +1,7 @@
 import enum
 from datetime import date, datetime
 
-from sqlalchemy import BigInteger, Date, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func, Index, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from bot.db.base import Base
@@ -10,6 +10,7 @@ from bot.db.base import Base
 class UserRole(str, enum.Enum):
     agent = "agent"
     client = "client"
+    superadmin = "superadmin"
 
 
 class Tenant(Base):
@@ -212,10 +213,14 @@ class InviteStatus(str, enum.Enum):
 class AgentInvite(Base):
     __tablename__ = "agent_invites"
 
+    INVITE_TYPE_CLIENT = "client"
+    INVITE_TYPE_AGENT_REGISTRATION = "agent_registration"
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False)
     agent_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     target_client_id: Mapped[int | None] = mapped_column(ForeignKey("clients.id", ondelete="SET NULL"), index=True, nullable=True)
+    invite_type: Mapped[str] = mapped_column(String(20), default=INVITE_TYPE_CLIENT, nullable=False)
     token: Mapped[str] = mapped_column(String(96), unique=True, index=True, nullable=False)
     is_public: Mapped[bool] = mapped_column(default=False, nullable=False, index=True)
     status: Mapped[InviteStatus] = mapped_column(
@@ -351,3 +356,118 @@ class ContractDocument(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     contract: Mapped["Contract"] = relationship(back_populates="documents")
+
+
+class InsuranceCompany(Base):
+    __tablename__ = "insurance_companies"
+    __table_args__ = (UniqueConstraint("tenant_id", "name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    tenant: Mapped["Tenant"] = relationship()
+    insurance_types: Mapped[list["InsuranceType"]] = relationship(back_populates="company", cascade="all, delete-orphan")
+    tariff_cards: Mapped[list["TariffCard"]] = relationship(back_populates="company", cascade="all, delete-orphan")
+
+
+class InsuranceType(Base):
+    __tablename__ = "insurance_types"
+    __table_args__ = (
+        Index(
+            "ux_insurance_types_non_other",
+            "tenant_id",
+            "company_id",
+            "type_key",
+            unique=True,
+            postgresql_where=text("type_key <> 'other'"),
+            sqlite_where=text("type_key <> 'other'"),
+        ),
+        Index(
+            "ux_insurance_types_other",
+            "tenant_id",
+            "company_id",
+            "type_key",
+            "custom_name",
+            unique=True,
+            postgresql_where=text("type_key = 'other'"),
+            sqlite_where=text("type_key = 'other'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False)
+    company_id: Mapped[int] = mapped_column(ForeignKey("insurance_companies.id", ondelete="CASCADE"), index=True, nullable=False)
+    type_key: Mapped[str] = mapped_column(String(50), nullable=False)
+    custom_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    tenant: Mapped["Tenant"] = relationship()
+    company: Mapped["InsuranceCompany"] = relationship(back_populates="insurance_types")
+    tariff_cards: Mapped[list["TariffCard"]] = relationship(back_populates="insurance_type", cascade="all, delete-orphan")
+    documents: Mapped[list["InsuranceTypeDocument"]] = relationship(back_populates="insurance_type", cascade="all, delete-orphan")
+
+
+class TariffCard(Base):
+    __tablename__ = "tariff_cards"
+    __table_args__ = (UniqueConstraint("tenant_id", "company_id", "insurance_type_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False)
+    company_id: Mapped[int | None] = mapped_column(
+        ForeignKey("insurance_companies.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    insurance_type_id: Mapped[int | None] = mapped_column(
+        ForeignKey("insurance_types.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    card_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    config: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    tenant: Mapped["Tenant"] = relationship()
+    company: Mapped["InsuranceCompany | None"] = relationship(back_populates="tariff_cards")
+    insurance_type: Mapped["InsuranceType | None"] = relationship(back_populates="tariff_cards")
+
+
+class InsuranceTypeDocument(Base):
+    __tablename__ = "insurance_type_documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    insurance_type_id: Mapped[int] = mapped_column(
+        ForeignKey("insurance_types.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False)
+    file_id: Mapped[str] = mapped_column(String(250), nullable=False)
+    file_unique_id: Mapped[str | None] = mapped_column(String(250), nullable=True)
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    insurance_type: Mapped["InsuranceType"] = relationship(back_populates="documents")
+    tenant: Mapped["Tenant"] = relationship()
+
+
+class DefaultTariff(Base):
+    __tablename__ = "default_tariffs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    type_key: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    card_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    config: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

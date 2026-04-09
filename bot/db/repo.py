@@ -4,8 +4,8 @@ import secrets
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.orm import joinedload, selectinload
 
 from bot.db.base import get_session_maker
 from bot.db.models import (
@@ -31,9 +31,13 @@ from bot.db.models import (
     User,
     UserRole,
     Tenant,
+    InsuranceCompany,
+    InsuranceType,
+    TariffCard,
+    InsuranceTypeDocument,
+    DefaultTariff,
 )
 
-from sqlalchemy import or_
 from datetime import date
 
 
@@ -43,6 +47,32 @@ async def _get_default_tenant(session) -> Tenant:
     if tenant is not None:
         return tenant
     tenant = Tenant(code="default", title="Default tenant")
+    session.add(tenant)
+    await session.flush()
+    return tenant
+
+
+async def _get_or_create_agent_tenant(
+    session,
+    agent_tg_id: int,
+    title: str | None = None,
+) -> Tenant:
+    """
+    Возвращает персональный тенант агента.
+    code = f"agent_{agent_tg_id}"
+    Если не существует — создаёт.
+    """
+    code = f"agent_{agent_tg_id}"
+    res = await session.execute(
+        select(Tenant).where(Tenant.code == code)
+    )
+    tenant = res.scalar_one_or_none()
+    if tenant is not None:
+        return tenant
+    tenant = Tenant(
+        code=code,
+        title=title or f"Агент {agent_tg_id}",
+    )
     session.add(tenant)
     await session.flush()
     return tenant
@@ -68,21 +98,113 @@ async def get_or_create_user(tg_id: int) -> User:
         return user
 
 
-async def set_user_role(tg_id: int, role: UserRole) -> User:
+async def set_user_role(
+    tg_id: int,
+    role: UserRole,
+    *,
+    display_name: str | None = None,
+) -> User:
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(User).where(User.tg_id == tg_id)
+        )
+        user = res.scalar_one_or_none()
+
+        if role == UserRole.agent:
+            tenant = await _get_or_create_agent_tenant(
+                session, tg_id, title=display_name
+            )
+        else:
+            tenant = await _get_default_tenant(session)
+
+        if user is None:
+            user = User(
+                tg_id=tg_id,
+                role=role,
+                tenant_id=tenant.id
+            )
+            if display_name:
+                user.display_name = display_name
+            session.add(user)
+        else:
+            user.role = role
+            if role == UserRole.agent:
+                user.tenant_id = tenant.id
+            elif user.tenant_id is None:
+                user.tenant_id = tenant.id
+            if display_name and not user.display_name:
+                user.display_name = display_name
+
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+async def set_superadmin(tg_id: int) -> User:
+    """Устанавливает роль superadmin."""
     async with get_session_maker()() as session:
         res = await session.execute(select(User).where(User.tg_id == tg_id))
         user = res.scalar_one_or_none()
         tenant = await _get_default_tenant(session)
         if user is None:
-            user = User(tg_id=tg_id, role=role, tenant_id=tenant.id)
+            user = User(
+                tg_id=tg_id,
+                role=UserRole.superadmin,
+                tenant_id=tenant.id,
+            )
             session.add(user)
         else:
-            user.role = role
+            user.role = UserRole.superadmin
             if user.tenant_id is None:
                 user.tenant_id = tenant.id
         await session.commit()
         await session.refresh(user)
         return user
+
+
+async def get_all_agents() -> list[User]:
+    """Все пользователи с ролью agent."""
+    from bot.config import get_settings
+
+    settings = get_settings()
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(User)
+            .where(User.role == UserRole.agent)
+            .where(User.tg_id != settings.superadmin_tg_id)
+            .order_by(User.created_at.desc())
+        )
+        return list(res.scalars().all())
+
+
+async def get_agent_by_tg_id(tg_id: int) -> User | None:
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(User).where(
+                User.tg_id == tg_id,
+                User.role == UserRole.agent,
+            )
+        )
+        return res.scalar_one_or_none()
+
+
+async def count_clients_by_agent(
+    agent_user_id: int,
+) -> int:
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(func.count(Client.id))
+            .where(Client.agent_user_id == agent_user_id)
+        )
+        return int(res.scalar_one() or 0)
+
+
+async def get_all_tenants() -> list[Tenant]:
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(Tenant).order_by(Tenant.created_at)
+        )
+        return list(res.scalars().all())
 
 
 def _hash_password(password: str, salt: str) -> str:
@@ -252,6 +374,7 @@ async def create_agent_invite(
             tenant_id=user.tenant_id,
             agent_user_id=user.id,
             target_client_id=target_client_id,
+            invite_type=AgentInvite.INVITE_TYPE_CLIENT,
             token=token,
             is_public=False,
             status=InviteStatus.active,
@@ -264,6 +387,167 @@ async def create_agent_invite(
         return inv
 
 
+async def create_superadmin_invite(
+    sa_tg_id: int,
+    ttl_hours: int = 168,
+) -> AgentInvite | None:
+    """
+    Создаёт инвайт для нового агента от имени суперадмина.
+    """
+    async with get_session_maker()() as session:
+        res = await session.execute(select(User).where(User.tg_id == sa_tg_id))
+        sa_user = res.scalar_one_or_none()
+        if sa_user is None or sa_user.role != UserRole.superadmin:
+            return None
+        if sa_user.tenant_id is None:
+            tenant = await _get_default_tenant(session)
+            sa_user.tenant_id = tenant.id
+            await session.flush()
+        token = secrets.token_urlsafe(24)
+        inv = AgentInvite(
+            tenant_id=sa_user.tenant_id,
+            agent_user_id=sa_user.id,
+            invite_type=AgentInvite.INVITE_TYPE_AGENT_REGISTRATION,
+            token=token,
+            is_public=False,
+            status=InviteStatus.active,
+            uses_left=1,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=ttl_hours),
+        )
+        session.add(inv)
+        await session.commit()
+        await session.refresh(inv)
+        return inv
+
+
+async def block_agent(agent_tg_id: int) -> bool:
+    """
+    Блокирует агента: role -> None.
+    Возвращает True если агент найден и заблокирован.
+    """
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(User).where(
+                User.tg_id == agent_tg_id,
+                User.role == UserRole.agent,
+            )
+        )
+        user = res.scalar_one_or_none()
+        if user is None:
+            return False
+        user.role = None
+        await session.commit()
+        return True
+
+
+async def reset_test_clients() -> int:
+    """
+    Сбрасывает всех клиентов:
+    - Удаляет записи из clients, где source_user_id указывает на клиента
+    - Сбрасывает tenant_id на дефолтный
+    - Сбрасывает role в None
+    Возвращает количество сброшенных пользователей.
+    """
+    async with get_session_maker()() as session:
+        default_tenant = await _get_default_tenant(session)
+
+        res = await session.execute(select(User).where(User.role == UserRole.client))
+        client_users = list(res.scalars().all())
+        if not client_users:
+            return 0
+
+        user_ids = [u.id for u in client_users]
+
+        await session.execute(
+            delete(Client).where(Client.source_user_id.in_(user_ids))
+        )
+
+        await session.execute(
+            update(User)
+            .where(User.role == UserRole.client)
+            .values(
+                tenant_id=default_tenant.id,
+                role=None,
+            )
+        )
+
+        await session.commit()
+        return len(client_users)
+
+
+async def reset_test_agents(exclude_tg_id: int | None = None) -> int:
+    """
+    Полный сброс тестовых агентов.
+    Удаляет все связанное с агентом и сбрасывает аккаунт до базового состояния.
+
+    exclude_tg_id — tg_id суперадмина, его не трогаем.
+    Возвращает количество сброшенных агентов.
+    """
+    async with get_session_maker()() as session:
+        default_tenant = await _get_default_tenant(session)
+
+        query = select(User).where(User.role == UserRole.agent)
+        if exclude_tg_id:
+            query = query.where(User.tg_id != exclude_tg_id)
+
+        res = await session.execute(query)
+        agents = list(res.scalars().all())
+        if not agents:
+            return 0
+
+        agent_user_ids = [a.id for a in agents]
+        agent_tenant_ids = [
+            a.tenant_id
+            for a in agents
+            if a.tenant_id and a.tenant_id != default_tenant.id
+        ]
+
+        # Удаляем сущности в явном порядке, чтобы избежать FK-проблем.
+        agent_client_ids_subq = select(Client.id).where(
+            Client.agent_user_id.in_(agent_user_ids)
+        )
+        await session.execute(
+            delete(Payment).where(
+                Payment.contract_id.in_(
+                    select(Contract.id).where(
+                        Contract.client_id.in_(agent_client_ids_subq)
+                    )
+                )
+            )
+        )
+        await session.execute(
+            delete(Contract).where(Contract.client_id.in_(agent_client_ids_subq))
+        )
+        await session.execute(
+            delete(Client).where(Client.agent_user_id.in_(agent_user_ids))
+        )
+
+        await session.execute(
+            delete(AgentInvite).where(AgentInvite.agent_user_id.in_(agent_user_ids))
+        )
+        await session.execute(
+            delete(AgentCredential).where(AgentCredential.user_id.in_(agent_user_ids))
+        )
+
+        await session.execute(
+            update(User)
+            .where(User.id.in_(agent_user_ids))
+            .values(
+                role=None,
+                tenant_id=default_tenant.id,
+                display_name=None,
+            )
+        )
+
+        if agent_tenant_ids:
+            await session.execute(
+                delete(Tenant).where(Tenant.id.in_(agent_tenant_ids))
+            )
+
+        await session.commit()
+        return len(agents)
+
+
 async def get_agent_invite_by_token(token: str) -> AgentInvite | None:
     async with get_session_maker()() as session:
         res = await session.execute(
@@ -272,6 +556,76 @@ async def get_agent_invite_by_token(token: str) -> AgentInvite | None:
             .limit(1)
         )
         return res.scalar_one_or_none()
+
+
+async def validate_private_invite_for_action(token: str) -> tuple[AgentInvite | None, str]:
+    """
+    Проверяет непубличный инвайт по токену (без списания).
+    При истечении срока или исчерпании обновляет статус в БД.
+    Возвращает (invite, "ok") или (None, код_ошибки).
+    """
+    async with get_session_maker()() as session:
+        inv_res = await session.execute(
+            select(AgentInvite)
+            .where(
+                AgentInvite.token == token,
+                AgentInvite.is_public.is_(False),
+            )
+            .limit(1)
+        )
+        inv = inv_res.scalar_one_or_none()
+        if inv is None:
+            return None, "invite_not_found"
+        if inv.status != InviteStatus.active:
+            return None, "invite_not_active"
+        now = datetime.now(timezone.utc)
+        if inv.expires_at is not None and inv.expires_at <= now:
+            inv.status = InviteStatus.expired
+            await session.commit()
+            return None, "invite_expired"
+        if inv.uses_left <= 0:
+            inv.status = InviteStatus.used
+            await session.commit()
+            return None, "invite_depleted"
+        return inv, "ok"
+
+
+async def consume_agent_registration_invite(token: str, agent_tg_id: int) -> tuple[bool, str]:
+    """
+    Помечает использованным инвайт регистрации агента (после ввода имени в профиле).
+    """
+    async with get_session_maker()() as session:
+        inv_res = await session.execute(select(AgentInvite).where(AgentInvite.token == token).limit(1))
+        inv = inv_res.scalar_one_or_none()
+        if inv is None:
+            return False, "invite_not_found"
+        inv_kind = (getattr(inv, "invite_type", None) or AgentInvite.INVITE_TYPE_CLIENT)
+        if inv_kind != AgentInvite.INVITE_TYPE_AGENT_REGISTRATION:
+            return False, "invite_wrong_type"
+        if inv.status != InviteStatus.active:
+            return False, "invite_not_active"
+        now = datetime.now(timezone.utc)
+        if inv.expires_at is not None and inv.expires_at <= now:
+            inv.status = InviteStatus.expired
+            await session.commit()
+            return False, "invite_expired"
+        if inv.uses_left <= 0:
+            inv.status = InviteStatus.used
+            await session.commit()
+            return False, "invite_depleted"
+
+        user_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        user = user_res.scalar_one_or_none()
+        if user is None or user.role != UserRole.agent:
+            return False, "not_agent"
+
+        inv.uses_left -= 1
+        inv.used_at = now
+        inv.used_by_user_id = user.id
+        if inv.uses_left <= 0:
+            inv.status = InviteStatus.used
+        await session.commit()
+        return True, "ok"
 
 
 async def consume_agent_invite(
@@ -293,6 +647,9 @@ async def consume_agent_invite(
         inv = inv_res.scalar_one_or_none()
         if inv is None:
             return False, "invite_not_found"
+        inv_kind = (getattr(inv, "invite_type", None) or AgentInvite.INVITE_TYPE_CLIENT)
+        if inv_kind == AgentInvite.INVITE_TYPE_AGENT_REGISTRATION:
+            return False, "invite_wrong_type"
         if inv.status != InviteStatus.active:
             return False, "invite_not_active"
         if inv.expires_at is not None and inv.expires_at <= datetime.now(timezone.utc):
@@ -311,7 +668,8 @@ async def consume_agent_invite(
             session.add(user)
             await session.flush()
         else:
-            if user.tenant_id is None:
+            default_tenant = await _get_default_tenant(session)
+            if user.tenant_id is None or user.tenant_id == default_tenant.id:
                 user.tenant_id = inv.tenant_id
             elif user.tenant_id != inv.tenant_id:
                 return False, "user_in_other_tenant"
@@ -521,7 +879,8 @@ async def consume_public_agent_link(
             session.add(user)
             await session.flush()
         else:
-            if user.tenant_id is None:
+            default_tenant = await _get_default_tenant(session)
+            if user.tenant_id is None or user.tenant_id == default_tenant.id:
                 user.tenant_id = inv.tenant_id
             elif user.tenant_id != inv.tenant_id:
                 return False, "user_in_other_tenant"
@@ -2371,5 +2730,713 @@ async def delete_client(agent_tg_id: int, client_id: int) -> bool:
         if client is None:
             return False
         await session.delete(client)
+        await session.commit()
+        return True
+
+
+async def create_insurance_company(
+    agent_tg_id: int,
+    name: str,
+) -> InsuranceCompany | None:
+    """
+    Создаёт страховую компанию для агента.
+    Если компания с таким именем уже есть
+    у этого тенанта — возвращает существующую
+    (upsert по tenant_id + name).
+    """
+    company_name = name.strip()
+    if not company_name:
+        return None
+
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return None
+
+        existing_res = await session.execute(
+            select(InsuranceCompany).where(
+                InsuranceCompany.tenant_id == agent.tenant_id,
+                InsuranceCompany.name == company_name,
+            )
+        )
+        existing = existing_res.scalar_one_or_none()
+        if existing is not None:
+            if not existing.is_active:
+                existing.is_active = True
+                await session.commit()
+                await session.refresh(existing)
+            return existing
+
+        company = InsuranceCompany(
+            tenant_id=agent.tenant_id,
+            name=company_name,
+            is_active=True,
+        )
+        session.add(company)
+        await session.commit()
+        await session.refresh(company)
+        return company
+
+
+async def list_insurance_companies(
+    agent_tg_id: int,
+    active_only: bool = True,
+) -> list[InsuranceCompany]:
+    """
+    Список компаний агента.
+    active_only=True → только is_active=True.
+    Сортировка по name ASC.
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return []
+
+        stmt = (
+            select(InsuranceCompany)
+            .where(InsuranceCompany.tenant_id == agent.tenant_id)
+            .order_by(InsuranceCompany.name.asc())
+        )
+        if active_only:
+            stmt = stmt.where(InsuranceCompany.is_active.is_(True))
+
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+
+async def get_insurance_company(
+    agent_tg_id: int,
+    company_id: int,
+) -> InsuranceCompany | None:
+    """
+    Получить компанию по id.
+    Проверить что company.tenant_id ==
+    tenant агента (безопасность).
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return None
+
+        res = await session.execute(
+            select(InsuranceCompany).where(
+                InsuranceCompany.id == company_id,
+                InsuranceCompany.tenant_id == agent.tenant_id,
+            )
+        )
+        return res.scalar_one_or_none()
+
+
+async def update_insurance_company(
+    agent_tg_id: int,
+    company_id: int,
+    name: str,
+) -> InsuranceCompany | None:
+    """
+    Переименовать компанию.
+    Проверить принадлежность тенанту.
+    """
+    company_name = name.strip()
+    if not company_name:
+        return None
+
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return None
+
+        res = await session.execute(
+            select(InsuranceCompany).where(
+                InsuranceCompany.id == company_id,
+                InsuranceCompany.tenant_id == agent.tenant_id,
+            )
+        )
+        company = res.scalar_one_or_none()
+        if company is None:
+            return None
+
+        company.name = company_name
+        await session.commit()
+        await session.refresh(company)
+        return company
+
+
+async def deactivate_insurance_company(
+    agent_tg_id: int,
+    company_id: int,
+) -> bool:
+    """
+    Мягкое удаление: is_active = False.
+    Проверить принадлежность тенанту.
+    Возвращает True если успешно.
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return False
+
+        res = await session.execute(
+            select(InsuranceCompany).where(
+                InsuranceCompany.id == company_id,
+                InsuranceCompany.tenant_id == agent.tenant_id,
+            )
+        )
+        company = res.scalar_one_or_none()
+        if company is None:
+            return False
+
+        company.is_active = False
+        await session.commit()
+        return True
+
+
+async def create_insurance_type(
+    agent_tg_id: int,
+    company_id: int,
+    type_key: str,
+    custom_name: str | None = None,
+) -> InsuranceType | None:
+    """
+    Добавить вид страхования к компании.
+    Проверить что company принадлежит тенанту.
+    Если вид уже существует (tenant+company+
+    type_key, и не "other") — вернуть
+    существующий.
+    custom_name обязателен если type_key="other".
+    """
+    normalized_key = type_key.strip().lower()
+    normalized_custom = custom_name.strip() if custom_name is not None else None
+    if not normalized_key:
+        return None
+    if normalized_key == "other" and not normalized_custom:
+        return None
+
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return None
+
+        company_res = await session.execute(
+            select(InsuranceCompany).where(
+                InsuranceCompany.id == company_id,
+                InsuranceCompany.tenant_id == agent.tenant_id,
+            )
+        )
+        company = company_res.scalar_one_or_none()
+        if company is None:
+            return None
+
+        if normalized_key != "other":
+            existing_res = await session.execute(
+                select(InsuranceType).where(
+                    InsuranceType.tenant_id == agent.tenant_id,
+                    InsuranceType.company_id == company_id,
+                    InsuranceType.type_key == normalized_key,
+                )
+            )
+            existing = existing_res.scalar_one_or_none()
+            if existing is not None:
+                if not existing.is_active:
+                    existing.is_active = True
+                    await session.commit()
+                    await session.refresh(existing)
+                return existing
+        else:
+            existing_res = await session.execute(
+                select(InsuranceType).where(
+                    InsuranceType.tenant_id == agent.tenant_id,
+                    InsuranceType.company_id == company_id,
+                    InsuranceType.type_key == normalized_key,
+                    InsuranceType.custom_name == normalized_custom,
+                )
+            )
+            existing = existing_res.scalar_one_or_none()
+            if existing is not None:
+                if not existing.is_active:
+                    existing.is_active = True
+                    await session.commit()
+                    await session.refresh(existing)
+                return existing
+
+        insurance_type = InsuranceType(
+            tenant_id=agent.tenant_id,
+            company_id=company_id,
+            type_key=normalized_key,
+            custom_name=normalized_custom,
+            is_active=True,
+            sort_order=0,
+        )
+        session.add(insurance_type)
+        await session.commit()
+        await session.refresh(insurance_type)
+        return insurance_type
+
+
+async def list_insurance_types(
+    agent_tg_id: int,
+    company_id: int | None = None,
+    active_only: bool = True,
+) -> list[InsuranceType]:
+    """
+    Виды страхования агента.
+    company_id=None → по всем компаниям тенанта.
+    active_only=True → только is_active=True.
+    Сортировка: sort_order ASC, custom_name ASC.
+    Загружать с joinedload(InsuranceType.company).
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return []
+
+        stmt = (
+            select(InsuranceType)
+            .options(joinedload(InsuranceType.company))
+            .where(InsuranceType.tenant_id == agent.tenant_id)
+            .order_by(InsuranceType.sort_order.asc(), InsuranceType.custom_name.asc())
+        )
+        if company_id is not None:
+            stmt = stmt.where(InsuranceType.company_id == company_id)
+        if active_only:
+            stmt = stmt.where(InsuranceType.is_active.is_(True))
+
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+
+async def list_unique_type_keys(
+    agent_tg_id: int,
+) -> list[str]:
+    """
+    Уникальные type_key которые есть у агента
+    хотя бы в одной компании (active_only=True).
+    Используется для меню клиента
+    "Рассчитать стоимость".
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return []
+
+        res = await session.execute(
+            select(InsuranceType.type_key)
+            .where(
+                InsuranceType.tenant_id == agent.tenant_id,
+                InsuranceType.is_active.is_(True),
+            )
+            .distinct()
+            .order_by(InsuranceType.type_key.asc())
+        )
+        return list(res.scalars().all())
+
+
+async def get_insurance_type(
+    agent_tg_id: int,
+    type_id: int,
+) -> InsuranceType | None:
+    """
+    Получить вид по id.
+    Проверить принадлежность тенанту.
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return None
+
+        res = await session.execute(
+            select(InsuranceType).where(
+                InsuranceType.id == type_id,
+                InsuranceType.tenant_id == agent.tenant_id,
+            )
+        )
+        return res.scalar_one_or_none()
+
+
+async def deactivate_insurance_type(
+    agent_tg_id: int,
+    type_id: int,
+) -> bool:
+    """
+    Мягкое удаление: is_active = False.
+    Проверить принадлежность тенанту.
+    """
+    async with get_session_maker()() as session:
+        agent_res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+        agent = agent_res.scalar_one_or_none()
+        if agent is None or agent.tenant_id is None:
+            return False
+
+        res = await session.execute(
+            select(InsuranceType).where(
+                InsuranceType.id == type_id,
+                InsuranceType.tenant_id == agent.tenant_id,
+            )
+        )
+        insurance_type = res.scalar_one_or_none()
+        if insurance_type is None:
+            return False
+
+        insurance_type.is_active = False
+        await session.commit()
+        return True
+
+
+async def _get_tenant_id_for_agent(
+    session,
+    agent_tg_id: int,
+) -> int | None:
+    """
+    Приватная. Возвращает tenant_id агента
+    по его tg_id.
+    """
+    res = await session.execute(select(User).where(User.tg_id == agent_tg_id))
+    agent = res.scalar_one_or_none()
+    if agent is None:
+        return None
+    return agent.tenant_id
+
+
+async def deactivate_insurance_type(
+    agent_tg_id: int,
+    type_id: int,
+) -> bool:
+    """
+    Мягкое удаление вида: is_active = False.
+    Проверить принадлежность тенанту.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return False
+
+        stmt = (
+            update(InsuranceType)
+            .where(InsuranceType.id == type_id)
+            .where(InsuranceType.tenant_id == tenant_id)
+            .values(is_active=False)
+        )
+        result = await session.execute(stmt)
+        if result.rowcount == 0:
+            await session.rollback()
+            return False
+
+        stmt2 = (
+            update(TariffCard)
+            .where(TariffCard.insurance_type_id == type_id)
+            .where(TariffCard.tenant_id == tenant_id)
+            .values(is_active=False)
+        )
+        await session.execute(stmt2)
+        await session.commit()
+        return True
+
+
+async def update_insurance_type_sort(
+    agent_tg_id: int,
+    type_id: int,
+    sort_order: int,
+) -> bool:
+    """
+    Изменить порядок отображения вида.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return False
+
+        res = await session.execute(
+            select(InsuranceType).where(
+                InsuranceType.id == type_id,
+                InsuranceType.tenant_id == tenant_id,
+            )
+        )
+        insurance_type = res.scalar_one_or_none()
+        if insurance_type is None:
+            return False
+
+        insurance_type.sort_order = sort_order
+        await session.commit()
+        return True
+
+
+async def upsert_tariff_card(
+    agent_tg_id: int,
+    insurance_type_id: int,
+    card_type: str,
+    config: dict,
+    company_id: int | None = None,
+) -> TariffCard | None:
+    """
+    Создать или обновить тарифную карту.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return None
+
+        insurance_type_res = await session.execute(
+            select(InsuranceType).where(
+                InsuranceType.id == insurance_type_id,
+                InsuranceType.tenant_id == tenant_id,
+            )
+        )
+        insurance_type = insurance_type_res.scalar_one_or_none()
+        if insurance_type is None:
+            return None
+
+        if company_id is not None:
+            company_res = await session.execute(
+                select(InsuranceCompany).where(
+                    InsuranceCompany.id == company_id,
+                    InsuranceCompany.tenant_id == tenant_id,
+                )
+            )
+            company = company_res.scalar_one_or_none()
+            if company is None:
+                return None
+
+        card_res = await session.execute(
+            select(TariffCard).where(
+                TariffCard.tenant_id == tenant_id,
+                TariffCard.company_id == company_id,
+                TariffCard.insurance_type_id == insurance_type_id,
+            )
+        )
+        card = card_res.scalar_one_or_none()
+        config_json = json.dumps(config, ensure_ascii=False)
+
+        if card is None:
+            card = TariffCard(
+                tenant_id=tenant_id,
+                company_id=company_id,
+                insurance_type_id=insurance_type_id,
+                card_type=card_type,
+                config=config_json,
+                is_active=True,
+            )
+            session.add(card)
+        else:
+            card.card_type = card_type
+            card.config = config_json
+            card.is_active = True
+
+        await session.commit()
+        await session.refresh(card)
+        return card
+
+
+async def get_tariff_card(
+    tenant_id: int,
+    insurance_type_id: int,
+    company_id: int | None = None,
+) -> TariffCard | None:
+    """
+    Получить тарифную карту.
+    """
+    async with get_session_maker()() as session:
+        exact_res = await session.execute(
+            select(TariffCard).where(
+                TariffCard.tenant_id == tenant_id,
+                TariffCard.insurance_type_id == insurance_type_id,
+                TariffCard.company_id == company_id,
+                TariffCard.is_active.is_(True),
+            )
+        )
+        exact = exact_res.scalar_one_or_none()
+        if exact is not None:
+            return exact
+
+        if company_id is not None:
+            fallback_res = await session.execute(
+                select(TariffCard).where(
+                    TariffCard.tenant_id == tenant_id,
+                    TariffCard.insurance_type_id == insurance_type_id,
+                    TariffCard.company_id.is_(None),
+                    TariffCard.is_active.is_(True),
+                )
+            )
+            return fallback_res.scalar_one_or_none()
+        return None
+
+
+async def get_default_tariff(
+    type_key: str,
+) -> DefaultTariff | None:
+    """
+    Получить дефолтный тариф по type_key.
+    Используется как fallback.
+    """
+    normalized_key = type_key.strip().lower()
+    if not normalized_key:
+        return None
+
+    async with get_session_maker()() as session:
+        res = await session.execute(
+            select(DefaultTariff).where(DefaultTariff.type_key == normalized_key)
+        )
+        return res.scalar_one_or_none()
+
+
+async def list_tariff_cards(
+    agent_tg_id: int,
+    company_id: int | None = None,
+) -> list[TariffCard]:
+    """
+    Список тарифных карт агента.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return []
+
+        stmt = (
+            select(TariffCard)
+            .options(joinedload(TariffCard.company), joinedload(TariffCard.insurance_type))
+            .where(
+                TariffCard.tenant_id == tenant_id,
+                TariffCard.is_active.is_(True),
+            )
+            .order_by(TariffCard.created_at.asc())
+        )
+        if company_id is not None:
+            stmt = stmt.where(TariffCard.company_id == company_id)
+
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+
+async def deactivate_tariff_card(
+    agent_tg_id: int,
+    card_id: int,
+) -> bool:
+    """
+    Мягкое удаление карты: is_active = False.
+    Проверить принадлежность тенанту.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return False
+
+        res = await session.execute(
+            select(TariffCard).where(
+                TariffCard.id == card_id,
+                TariffCard.tenant_id == tenant_id,
+            )
+        )
+        card = res.scalar_one_or_none()
+        if card is None:
+            return False
+
+        card.is_active = False
+        await session.commit()
+        return True
+
+
+async def create_insurance_type_document(
+    agent_tg_id: int,
+    insurance_type_id: int,
+    file_id: str,
+    file_unique_id: str | None,
+    caption: str | None,
+) -> InsuranceTypeDocument | None:
+    """
+    Прикрепить файл (правила) к виду
+    страхования.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return None
+
+        insurance_type_res = await session.execute(
+            select(InsuranceType).where(
+                InsuranceType.id == insurance_type_id,
+                InsuranceType.tenant_id == tenant_id,
+            )
+        )
+        insurance_type = insurance_type_res.scalar_one_or_none()
+        if insurance_type is None:
+            return None
+
+        doc = InsuranceTypeDocument(
+            insurance_type_id=insurance_type_id,
+            tenant_id=tenant_id,
+            file_id=file_id,
+            file_unique_id=file_unique_id,
+            caption=caption,
+        )
+        session.add(doc)
+        await session.commit()
+        await session.refresh(doc)
+        return doc
+
+
+async def list_insurance_type_documents(
+    agent_tg_id: int,
+    insurance_type_id: int,
+) -> list[InsuranceTypeDocument]:
+    """
+    Список документов вида страхования.
+    Сортировка по created_at ASC.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return []
+
+        insurance_type_res = await session.execute(
+            select(InsuranceType.id).where(
+                InsuranceType.id == insurance_type_id,
+                InsuranceType.tenant_id == tenant_id,
+            )
+        )
+        if insurance_type_res.scalar_one_or_none() is None:
+            return []
+
+        res = await session.execute(
+            select(InsuranceTypeDocument)
+            .where(
+                InsuranceTypeDocument.insurance_type_id == insurance_type_id,
+                InsuranceTypeDocument.tenant_id == tenant_id,
+            )
+            .order_by(InsuranceTypeDocument.created_at.asc())
+        )
+        return list(res.scalars().all())
+
+
+async def delete_insurance_type_document(
+    agent_tg_id: int,
+    doc_id: int,
+) -> bool:
+    """
+    Удалить документ.
+    Проверить принадлежность тенанту.
+    """
+    async with get_session_maker()() as session:
+        tenant_id = await _get_tenant_id_for_agent(session, agent_tg_id)
+        if tenant_id is None:
+            return False
+
+        res = await session.execute(
+            select(InsuranceTypeDocument).where(
+                InsuranceTypeDocument.id == doc_id,
+                InsuranceTypeDocument.tenant_id == tenant_id,
+            )
+        )
+        doc = res.scalar_one_or_none()
+        if doc is None:
+            return False
+
+        await session.delete(doc)
         await session.commit()
         return True

@@ -25,6 +25,7 @@ class Btn:
     SETTINGS = "⚙️ Настройки"
     ADD_PAYMENT = "💰 Внести взнос"
     SWITCH_TO_CLIENT = "🔁 Переключиться на клиента"
+    BACK_TO_ADMIN = "🔙 В режим Admin"
     MAIN_MENU = "🏠 Вернуться в главное меню"
 
 
@@ -39,15 +40,23 @@ def role_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def client_menu(*, allow_switch_to_agent: bool = False) -> ReplyKeyboardMarkup:
+def client_menu(
+    *,
+    allow_switch_to_agent: bool | None = None,
+    show_back_to_admin: bool = False,
+) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=Btn.CALC_PRICE)],
         [KeyboardButton(text=Btn.MY_CONTRACTS), KeyboardButton(text=Btn.MY_DOCS)],
         [KeyboardButton(text=Btn.CONTACT_AGENT)],
         [KeyboardButton(text=Btn.NEXT_PAYMENT)],
     ]
+    if allow_switch_to_agent is None:
+        allow_switch_to_agent = show_back_to_admin
     if allow_switch_to_agent:
         rows.append([KeyboardButton(text=Btn.SWITCH_TO_AGENT)])
+    if show_back_to_admin:
+        rows.append([KeyboardButton(text=Btn.BACK_TO_ADMIN)])
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
@@ -55,17 +64,23 @@ def client_menu(*, allow_switch_to_agent: bool = False) -> ReplyKeyboardMarkup:
     )
 
 
-def agent_menu() -> ReplyKeyboardMarkup:
+def agent_menu(*, show_back_to_admin: bool = False, allow_switch_to_client: bool | None = None) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=Btn.INCOMING), KeyboardButton(text=Btn.IN_PROGRESS)],
+        [KeyboardButton(text=Btn.DASHBOARD)],
+        [KeyboardButton(text=Btn.MY_CLIENTS)],
+        [KeyboardButton(text=Btn.ADD_PAYMENT)],
+        [KeyboardButton(text=Btn.REMINDERS), KeyboardButton(text=Btn.REPORTS)],
+        [KeyboardButton(text=Btn.SETTINGS)],
+    ]
+    if allow_switch_to_client is None:
+        allow_switch_to_client = show_back_to_admin
+    if allow_switch_to_client:
+        rows.append([KeyboardButton(text=Btn.SWITCH_TO_CLIENT)])
+    if show_back_to_admin:
+        rows.append([KeyboardButton(text=Btn.BACK_TO_ADMIN)])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=Btn.INCOMING), KeyboardButton(text=Btn.IN_PROGRESS)],
-            [KeyboardButton(text=Btn.DASHBOARD)],
-            [KeyboardButton(text=Btn.MY_CLIENTS)],
-            [KeyboardButton(text=Btn.ADD_PAYMENT)],
-            [KeyboardButton(text=Btn.REMINDERS), KeyboardButton(text=Btn.REPORTS)],
-            [KeyboardButton(text=Btn.SETTINGS)],
-            [KeyboardButton(text=Btn.SWITCH_TO_CLIENT)],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         input_field_placeholder="Выберите действие",
     )
@@ -129,3 +144,37 @@ def insurance_type_keyboard(prefix: str) -> InlineKeyboardMarkup:
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _settings_root_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧑‍💼 Агент", callback_data="aset:group:agent")],
+            [InlineKeyboardButton(text="👥 Клиенты", callback_data="aset:group:clients")],
+            [InlineKeyboardButton(text="🏢 Страховые компании", callback_data="aset:companies")],
+            [InlineKeyboardButton(text="← Закрыть", callback_data="aset:close")],
+        ]
+    )
+
+
+def _settings_agent_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔐 Доступ агента", callback_data="aset:auth")],
+            [InlineKeyboardButton(text="✏️ Имя агента", callback_data="aset:profile_name")],
+            [InlineKeyboardButton(text="📞 Контакты", callback_data="aset:contacts")],
+            [InlineKeyboardButton(text="← Назад", callback_data="aset:root")],
+        ]
+    )
+
+
+def _settings_clients_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Пригласить клиента", callback_data="aset:invite:create")],
+            [InlineKeyboardButton(text="🔗 Публичная ссылка", callback_data="aset:public_link")],
+            [InlineKeyboardButton(text="📋 Мои инвайты", callback_data="aset:invite:list")],
+            [InlineKeyboardButton(text="📢 Сообщение всем клиентам", callback_data="aset:broadcast")],
+            [InlineKeyboardButton(text="← Назад", callback_data="aset:root")],
+        ]
+    )

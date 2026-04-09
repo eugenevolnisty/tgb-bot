@@ -61,12 +61,12 @@ class ReminderEdit(StatesGroup):
 
 async def _ensure_agent(message: Message) -> bool:
     user = await get_or_create_user(message.from_user.id)
-    return user.role == UserRole.agent
+    return user.role in {UserRole.agent, UserRole.superadmin}
 
 
 async def _ensure_agent_tg(tg_id: int) -> bool:
     user = await get_or_create_user(tg_id)
-    return user.role == UserRole.agent
+    return user.role in {UserRole.agent, UserRole.superadmin}
 
 
 @router.message(F.text == Btn.REMINDERS)
@@ -77,10 +77,14 @@ async def open_reminders(message: Message) -> None:
 
 
 @router.message(F.text == RemindersMenu.BACK)
-async def reminders_back(message: Message, state: FSMContext) -> None:
+async def reminders_back(message: Message, state: FSMContext, data: dict) -> None:
+    is_superadmin = data.get("is_superadmin", False)
     if await state.get_state() is not None:
         await state.clear()
-    await message.answer("Главное меню", reply_markup=agent_menu())
+    await message.answer(
+        "Главное меню",
+        reply_markup=agent_menu(show_back_to_admin=is_superadmin),
+    )
 
 
 @router.message(F.text == RemindersMenu.MY)

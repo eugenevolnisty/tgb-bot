@@ -11,12 +11,14 @@ from bot.handlers.reminders import router as reminders_router
 from bot.handlers.clients import router as clients_router
 from bot.handlers.payment_reports import router as payment_reports_router
 from bot.handlers.contract_reports import router as contract_reports_router
+from bot.handlers.superadmin import router as superadmin_router
 from bot.handlers.commission_reports import router as commission_reports_router
 from bot.middlewares.access_guard import AccessGuardMiddleware
 
 router = Router()
 router.message.outer_middleware(AccessGuardMiddleware())
 router.callback_query.outer_middleware(AccessGuardMiddleware())
+router.include_router(superadmin_router)
 router.include_router(start_router)
 router.include_router(client_router)
 router.include_router(agent_router)

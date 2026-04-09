@@ -151,12 +151,12 @@ def _yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 async def _ensure_client(message: Message) -> bool:
     user = await get_or_create_user(message.from_user.id)
-    return user.role == UserRole.client
+    return user.role in {UserRole.client, UserRole.superadmin}
 
 
 async def _ensure_client_tg(tg_id: int) -> bool:
     user = await get_or_create_user(tg_id)
-    return user.role == UserRole.client
+    return user.role in {UserRole.client, UserRole.superadmin}
 
 
 def _kind_title(kind: str, other_kind: str | None = None) -> str:
@@ -295,7 +295,7 @@ async def cmr_pick_limit(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.message(GenericCalc.cmr_auto_count)
-async def cmr_auto_count(message: Message, state: FSMContext) -> None:
+async def cmr_auto_count(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     try:
         auto_count = int((message.text or "").strip())
     except ValueError:
@@ -312,7 +312,7 @@ async def cmr_auto_count(message: Message, state: FSMContext) -> None:
     if per_auto is None:
         await message.answer("Не удалось рассчитать CMR. Попробуйте начать заново.")
         await state.clear()
-        await message.answer("Главное меню", reply_markup=client_menu())
+        await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
         return
 
     premium = per_auto * auto_count
@@ -352,11 +352,11 @@ async def cmr_auto_count(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Главное меню", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 
 
 @router.message(GenericCalc.expeditor_plan)
-async def expeditor_plan(message: Message, state: FSMContext) -> None:
+async def expeditor_plan(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     plan = parse_plan_choice(message.text or "")
     if plan is None:
         await message.answer("Не понял пакет. Введите 1, 2, 3 или 4 (или название пакета).")
@@ -399,11 +399,11 @@ async def expeditor_plan(message: Message, state: FSMContext) -> None:
     ]
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Главное меню", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 
 
 @router.callback_query(GenericCalc.expeditor_plan, F.data.startswith("expplan:"))
-async def expeditor_plan_pick(callback: CallbackQuery, state: FSMContext) -> None:
+async def expeditor_plan_pick(callback: CallbackQuery, state: FSMContext, is_superadmin: bool = False) -> None:
     if callback.message is None:
         await callback.answer()
         return
@@ -461,7 +461,7 @@ async def expeditor_plan_pick(callback: CallbackQuery, state: FSMContext) -> Non
     ]
     await state.clear()
     await callback.message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await callback.message.answer("Главное меню", reply_markup=client_menu())
+    await callback.message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
     await callback.answer()
 
 
@@ -786,7 +786,7 @@ async def accident_repeat(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(GenericCalc.accident_epolicy, F.data.startswith("acc:epolicy:"))
-async def accident_epolicy_callback(callback: CallbackQuery, state: FSMContext) -> None:
+async def accident_epolicy_callback(callback: CallbackQuery, state: FSMContext, is_superadmin: bool = False) -> None:
     if callback.message is None:
         await callback.answer()
         return
@@ -863,12 +863,12 @@ async def accident_epolicy_callback(callback: CallbackQuery, state: FSMContext) 
 
     await state.clear()
     await callback.message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await callback.message.answer("Главное меню", reply_markup=client_menu())
+    await callback.message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
     await callback.answer()
 
 
 @router.message(GenericCalc.accident_epolicy)
-async def accident_epolicy(message: Message, state: FSMContext) -> None:
+async def accident_epolicy(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     b = _yes_no(message.text or "")
     if b is None:
         await message.answer("Ответь: да или нет.")
@@ -938,7 +938,7 @@ async def accident_epolicy(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Главное меню", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 
 
 @router.message(GenericCalc.subject)
@@ -969,7 +969,7 @@ async def step_value(message: Message, state: FSMContext) -> None:
 
 
 @router.message(GenericCalc.comment)
-async def step_comment(message: Message, state: FSMContext) -> None:
+async def step_comment(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     text = (message.text or "").strip()
     if text.lower() == "нет":
         text = ""
@@ -1031,5 +1031,5 @@ async def step_comment(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Главное меню", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 

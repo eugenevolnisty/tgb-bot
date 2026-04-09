@@ -34,12 +34,12 @@ class KaskoCalc(StatesGroup):
 
 async def _ensure_client(message: Message) -> bool:
     user = await get_or_create_user(message.from_user.id)
-    return user.role == UserRole.client
+    return user.role in {UserRole.client, UserRole.superadmin}
 
 
 async def _ensure_client_tg(tg_id: int) -> bool:
     user = await get_or_create_user(tg_id)
-    return user.role == UserRole.client
+    return user.role in {UserRole.client, UserRole.superadmin}
 
 
 def _normalize_bool_ru(text: str) -> bool | None:
@@ -63,7 +63,7 @@ async def start_calc_menu(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("calc:type:"))
-async def pick_calc_type(callback: CallbackQuery, state: FSMContext) -> None:
+async def pick_calc_type(callback: CallbackQuery, state: FSMContext, is_superadmin: bool = False) -> None:
     if callback.message is None:
         await callback.answer()
         return
@@ -95,7 +95,10 @@ async def pick_calc_type(callback: CallbackQuery, state: FSMContext) -> None:
 
     if t != "kasko":
         await state.clear()
-        await callback.message.answer("Неизвестный вид страхования.", reply_markup=client_menu())
+        await callback.message.answer(
+            "Неизвестный вид страхования.",
+            reply_markup=client_menu(show_back_to_admin=is_superadmin),
+        )
         await callback.answer()
         return
 
@@ -130,11 +133,11 @@ async def step_contact(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text.casefold() == "отмена")
-async def cancel_any(message: Message, state: FSMContext) -> None:
+async def cancel_any(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     if await state.get_state() is None:
         return
     await state.clear()
-    await message.answer("Ок, отменил расчёт.", reply_markup=client_menu())
+    await message.answer("Ок, отменил расчёт.", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 
 
 @router.message(KaskoCalc.brand_model)
@@ -214,7 +217,7 @@ async def step_drivers_count(message: Message, state: FSMContext) -> None:
 
 
 @router.message(KaskoCalc.youngest_driver_age)
-async def step_youngest_age(message: Message, state: FSMContext) -> None:
+async def step_youngest_age(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     text = (message.text or "").strip()
     try:
         age = int(text)
@@ -270,11 +273,11 @@ async def step_youngest_age(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Главное меню", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 
 
 @router.callback_query(F.data.startswith("quote_apply:"))
-async def apply_quote(callback: CallbackQuery) -> None:
+async def apply_quote(callback: CallbackQuery, is_superadmin: bool = False) -> None:
     if callback.message is None:
         await callback.answer()
         return
@@ -311,6 +314,9 @@ async def apply_quote(callback: CallbackQuery) -> None:
             await callback.bot.send_message(agent_tg_id, notify_text)
         except Exception:
             pass
-    await callback.message.answer(f"Готово! Заявка №{app.id} создана и отправлена агенту.", reply_markup=client_menu())
+    await callback.message.answer(
+        f"Готово! Заявка №{app.id} создана и отправлена агенту.",
+        reply_markup=client_menu(show_back_to_admin=is_superadmin),
+    )
     await callback.answer("Заявка создана")
 

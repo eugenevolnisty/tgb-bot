@@ -1,4 +1,5 @@
 from functools import lru_cache
+import json
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -26,6 +27,16 @@ async def init_db() -> None:
 
     engine = get_engine()
     async with engine.begin() as conn:
+        # Extend user_role enum for PostgreSQL before metadata sync.
+        # On non-PostgreSQL backends this may fail; keep init flow resilient.
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text("ALTER TYPE user_role ADD VALUE IF NOT EXISTS 'superadmin'")
+                )
+        except Exception:
+            pass
+
         await conn.run_sync(Base.metadata.create_all)
 
         # Lightweight "migration" for existing DBs (create_all doesn't ALTER).
@@ -356,6 +367,16 @@ async def init_db() -> None:
             async with conn.begin_nested():
                 await conn.execute(
                     text(
+                        "ALTER TABLE IF EXISTS agent_invites "
+                        "ADD COLUMN IF NOT EXISTS invite_type VARCHAR(20) NOT NULL DEFAULT 'client'"
+                    )
+                )
+        except Exception:
+            pass
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    text(
                         "ALTER TABLE IF EXISTS clients "
                         "ADD COLUMN IF NOT EXISTS source_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL"
                     )
@@ -417,3 +438,281 @@ async def init_db() -> None:
                 )
         except Exception:
             pass
+
+
+async def migrate_agent_tenants() -> None:
+    """
+    Одноразовая миграция: создаёт персональный
+    тенант для каждого агента у которого
+    tenant_id указывает на "default" тенант.
+    Безопасно запускать повторно.
+    """
+    from sqlalchemy import select, update
+
+    from bot.db.models import AgentInvite, Tenant, User, UserRole
+
+    async with get_session_maker()() as session:
+        # Найти дефолтный тенант
+        res = await session.execute(
+            select(Tenant).where(Tenant.code == "default")
+        )
+        default_tenant = res.scalar_one_or_none()
+        if default_tenant is None:
+            return
+
+        # Найти всех агентов на дефолтном тенанте
+        res = await session.execute(
+            select(User).where(
+                User.role == UserRole.agent,
+                User.tenant_id == default_tenant.id,
+            )
+        )
+        agents = list(res.scalars().all())
+
+        for agent in agents:
+            # Создать персональный тенант
+            code = f"agent_{agent.tg_id}"
+            res = await session.execute(
+                select(Tenant).where(Tenant.code == code)
+            )
+            personal_tenant = res.scalar_one_or_none()
+            if personal_tenant is None:
+                personal_tenant = Tenant(
+                    code=code,
+                    title=agent.display_name or f"Агент {agent.tg_id}",
+                )
+                session.add(personal_tenant)
+                await session.flush()
+
+            # Переключить агента на персональный тенант
+            agent.tenant_id = personal_tenant.id
+
+            # Обновить все агентские инвайты
+            await session.execute(
+                update(AgentInvite)
+                .where(AgentInvite.agent_user_id == agent.id)
+                .values(tenant_id=personal_tenant.id)
+            )
+
+        await session.commit()
+
+
+async def migrate_tariff_tables() -> None:
+    """
+    Создаёт таблицы тарифной системы
+    если не существуют. Используем
+    CREATE TABLE IF NOT EXISTS +
+    ALTER TABLE ADD COLUMN IF NOT EXISTS
+    для безопасного добавления.
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        # 1) insurance_companies
+        for sql in [
+            (
+                "CREATE TABLE IF NOT EXISTS insurance_companies ("
+                "id SERIAL PRIMARY KEY, "
+                "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                "name VARCHAR(200) NOT NULL, "
+                "is_active BOOLEAN NOT NULL DEFAULT TRUE, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "CONSTRAINT uq_insurance_companies_tenant_name UNIQUE (tenant_id, name)"
+                ")"
+            ),
+            "ALTER TABLE IF EXISTS insurance_companies ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE IF EXISTS insurance_companies ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+            "CREATE INDEX IF NOT EXISTS ix_insurance_companies_tenant_id ON insurance_companies (tenant_id)",
+        ]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(sql))
+            except Exception:
+                pass
+
+        # 2) insurance_types
+        for sql in [
+            (
+                "CREATE TABLE IF NOT EXISTS insurance_types ("
+                "id SERIAL PRIMARY KEY, "
+                "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                "company_id INTEGER NOT NULL REFERENCES insurance_companies(id) ON DELETE CASCADE, "
+                "type_key VARCHAR(50) NOT NULL, "
+                "custom_name VARCHAR(200) NULL, "
+                "is_active BOOLEAN NOT NULL DEFAULT TRUE, "
+                "sort_order INTEGER NOT NULL DEFAULT 0, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ),
+            "ALTER TABLE IF EXISTS insurance_types ADD COLUMN IF NOT EXISTS custom_name VARCHAR(200) NULL",
+            "ALTER TABLE IF EXISTS insurance_types ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE IF EXISTS insurance_types ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE IF EXISTS insurance_types ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+            "CREATE INDEX IF NOT EXISTS ix_insurance_types_tenant_id ON insurance_types (tenant_id)",
+            "CREATE INDEX IF NOT EXISTS ix_insurance_types_company_id ON insurance_types (company_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_insurance_types_non_other "
+            "ON insurance_types (tenant_id, company_id, type_key) WHERE type_key <> 'other'",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_insurance_types_other "
+            "ON insurance_types (tenant_id, company_id, type_key, custom_name) WHERE type_key = 'other'",
+        ]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(sql))
+            except Exception:
+                pass
+
+        # 3) tariff_cards
+        for sql in [
+            (
+                "CREATE TABLE IF NOT EXISTS tariff_cards ("
+                "id SERIAL PRIMARY KEY, "
+                "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                "company_id INTEGER NULL REFERENCES insurance_companies(id) ON DELETE SET NULL, "
+                "insurance_type_id INTEGER NULL REFERENCES insurance_types(id) ON DELETE SET NULL, "
+                "card_type VARCHAR(30) NOT NULL, "
+                "config TEXT NOT NULL, "
+                "is_active BOOLEAN NOT NULL DEFAULT TRUE, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "CONSTRAINT uq_tariff_cards_scope UNIQUE (tenant_id, company_id, insurance_type_id)"
+                ")"
+            ),
+            "ALTER TABLE IF EXISTS tariff_cards ADD COLUMN IF NOT EXISTS card_type VARCHAR(30) NOT NULL DEFAULT 'percentage'",
+            "ALTER TABLE IF EXISTS tariff_cards ADD COLUMN IF NOT EXISTS config TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE IF EXISTS tariff_cards ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE IF EXISTS tariff_cards ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+            "ALTER TABLE IF EXISTS tariff_cards ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+            "CREATE INDEX IF NOT EXISTS ix_tariff_cards_tenant_id ON tariff_cards (tenant_id)",
+            "CREATE INDEX IF NOT EXISTS ix_tariff_cards_company_id ON tariff_cards (company_id)",
+            "CREATE INDEX IF NOT EXISTS ix_tariff_cards_insurance_type_id ON tariff_cards (insurance_type_id)",
+        ]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(sql))
+            except Exception:
+                pass
+
+        # 4) insurance_type_documents
+        for sql in [
+            (
+                "CREATE TABLE IF NOT EXISTS insurance_type_documents ("
+                "id SERIAL PRIMARY KEY, "
+                "insurance_type_id INTEGER NOT NULL REFERENCES insurance_types(id) ON DELETE CASCADE, "
+                "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                "file_id VARCHAR(250) NOT NULL, "
+                "file_unique_id VARCHAR(250) NULL, "
+                "caption TEXT NULL, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ),
+            "ALTER TABLE IF EXISTS insurance_type_documents ADD COLUMN IF NOT EXISTS file_unique_id VARCHAR(250) NULL",
+            "ALTER TABLE IF EXISTS insurance_type_documents ADD COLUMN IF NOT EXISTS caption TEXT NULL",
+            "ALTER TABLE IF EXISTS insurance_type_documents ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+            "CREATE INDEX IF NOT EXISTS ix_insurance_type_documents_insurance_type_id ON insurance_type_documents (insurance_type_id)",
+            "CREATE INDEX IF NOT EXISTS ix_insurance_type_documents_tenant_id ON insurance_type_documents (tenant_id)",
+        ]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(sql))
+            except Exception:
+                pass
+
+        # 5) default_tariffs
+        for sql in [
+            (
+                "CREATE TABLE IF NOT EXISTS default_tariffs ("
+                "id SERIAL PRIMARY KEY, "
+                "type_key VARCHAR(50) NOT NULL UNIQUE, "
+                "card_type VARCHAR(30) NOT NULL, "
+                "config TEXT NOT NULL, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            ),
+            "ALTER TABLE IF EXISTS default_tariffs ADD COLUMN IF NOT EXISTS card_type VARCHAR(30) NOT NULL DEFAULT 'percentage'",
+            "ALTER TABLE IF EXISTS default_tariffs ADD COLUMN IF NOT EXISTS config TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE IF EXISTS default_tariffs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+        ]:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(text(sql))
+            except Exception:
+                pass
+
+        default_tariffs_data = [
+            (
+                "kasko",
+                "parametric",
+                {
+                    "base_rate": 3.5,
+                    "min_premium": 300,
+                    "age_coefficients": {"0-1": 1.0, "2-3": 0.95, "4-5": 0.85, "6-7": 0.75, "8+": 0.65},
+                    "deductible_discount": {"0": 1.0, "100": 0.95, "300": 0.85, "500": 0.75},
+                },
+            ),
+            (
+                "osago",
+                "table",
+                {"rates": {"до 70 л.с.": 180, "70-100 л.с.": 270, "100-150 л.с.": 420, "150+ л.с.": 600}},
+            ),
+            ("property", "percentage", {"rate": 0.5, "min_premium": 50}),
+            (
+                "expeditor",
+                "packages",
+                {
+                    "packages": {
+                        "Базовый": {"price": 500, "limit": "50 000 EUR"},
+                        "Оптимальный": {"price": 900, "limit": "100 000 EUR"},
+                        "Расширенный": {"price": 1500, "limit": "200 000 EUR"},
+                        "Максимальный": {"price": 2500, "limit": "500 000 EUR"},
+                    }
+                },
+            ),
+            (
+                "travel",
+                "matrix",
+                {
+                    "zones": {
+                        "Европа": {
+                            "variant_A": {"1-7": 15, "8-15": 12, "16-30": 10, "31-90": 8},
+                            "variant_B": {"1-7": 25, "8-15": 20, "16-30": 17, "31-90": 14},
+                        },
+                        "Весь мир": {
+                            "variant_A": {"1-7": 25, "8-15": 20, "16-30": 17, "31-90": 14},
+                            "variant_B": {"1-7": 40, "8-15": 35, "16-30": 30, "31-90": 25},
+                        },
+                    }
+                },
+            ),
+            (
+                "cmr",
+                "parametric",
+                {
+                    "base_rates": {
+                        "general_cargo": 0.15,
+                        "dangerous_cargo": 0.35,
+                        "perishable": 0.25,
+                        "fragile": 0.30,
+                    },
+                    "limit_coefficients": {"50000": 1.0, "100000": 1.3, "200000": 1.5},
+                    "vehicle_count_discount": {"1": 1.0, "2-3": 0.95, "4-5": 0.90, "6+": 0.85},
+                },
+            ),
+        ]
+
+        insert_sql = text(
+            "INSERT INTO default_tariffs (type_key, card_type, config) "
+            "VALUES (:type_key, :card_type, :config) "
+            "ON CONFLICT (type_key) DO NOTHING"
+        )
+        for type_key, card_type, config in default_tariffs_data:
+            try:
+                async with conn.begin_nested():
+                    await conn.execute(
+                        insert_sql,
+                        {
+                            "type_key": type_key,
+                            "card_type": card_type,
+                            "config": json.dumps(config, ensure_ascii=False),
+                        },
+                    )
+            except Exception:
+                pass

@@ -102,14 +102,14 @@ async def _ensure_agent(message: Message) -> bool:
     from bot.db.repo import get_or_create_user
 
     user = await get_or_create_user(message.from_user.id)
-    return user.role == UserRole.agent
+    return user.role in {UserRole.agent, UserRole.superadmin}
 
 
 async def _ensure_agent_tg(tg_id: int) -> bool:
     from bot.db.repo import get_or_create_user
 
     user = await get_or_create_user(tg_id)
-    return user.role == UserRole.agent
+    return user.role in {UserRole.agent, UserRole.superadmin}
 
 
 class ClientsMenu:
@@ -376,12 +376,13 @@ async def client_bind_invite_create(callback: CallbackQuery) -> None:
 
 
 @router.message(F.text == ClientsMenu.BACK)
-async def clients_back(message: Message, state: FSMContext) -> None:
+async def clients_back(message: Message, state: FSMContext, data: dict) -> None:
+    is_superadmin = data.get("is_superadmin", False)
     if await state.get_state() is not None:
         await state.clear()
     _LAST_CLIENTS_BY_AGENT.pop(message.from_user.id, None)
     _CLIENTS_FILTER_BY_AGENT.pop(message.from_user.id, None)
-    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
+    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu(show_back_to_admin=is_superadmin))
 
 
 class PaymentInsert(StatesGroup):
@@ -410,11 +411,12 @@ async def agent_add_payment_start(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data == "payins:back")
-async def agent_add_payment_back(callback: CallbackQuery, state: FSMContext) -> None:
+async def agent_add_payment_back(callback: CallbackQuery, state: FSMContext, data: dict) -> None:
+    is_superadmin = data.get("is_superadmin", False)
     if await state.get_state() is not None:
         await state.clear()
     await _clear_flow_prompt(callback.message, "payment_insert")
-    await _set_reply_keyboard_silent_callback(callback, text="Выберите действие.", reply_markup=agent_menu())
+    await _set_reply_keyboard_silent_callback(callback, text="Выберите действие.", reply_markup=agent_menu(show_back_to_admin=is_superadmin))
     await callback.answer()
 
 
@@ -446,7 +448,8 @@ async def agent_add_payment_search_client(callback: CallbackQuery, state: FSMCon
 
 
 @router.message(PaymentInsert.search_contract)
-async def agent_add_payment_search_contract_query(message: Message, state: FSMContext) -> None:
+async def agent_add_payment_search_contract_query(message: Message, state: FSMContext, data: dict) -> None:
+    is_superadmin = data.get("is_superadmin", False)
     if not await _ensure_agent(message):
         return
     query = (message.text or "").strip()
@@ -457,7 +460,7 @@ async def agent_add_payment_search_contract_query(message: Message, state: FSMCo
     await state.clear()
     await _clear_flow_prompt(message, "payment_insert")
     if not contracts:
-        await message.answer("По этому номеру договор не найден.", reply_markup=agent_menu())
+        await message.answer("По этому номеру договор не найден.", reply_markup=agent_menu(show_back_to_admin=is_superadmin))
         return
 
     kb_rows: list[list[InlineKeyboardButton]] = []
@@ -471,11 +474,12 @@ async def agent_add_payment_search_contract_query(message: Message, state: FSMCo
         kb_rows.append(row)
 
     await message.answer("Найденные договоры:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
+    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu(show_back_to_admin=is_superadmin))
 
 
 @router.message(PaymentInsert.search_client)
-async def agent_add_payment_search_client_query(message: Message, state: FSMContext) -> None:
+async def agent_add_payment_search_client_query(message: Message, state: FSMContext, data: dict) -> None:
+    is_superadmin = data.get("is_superadmin", False)
     if not await _ensure_agent(message):
         return
     query = (message.text or "").strip()
@@ -486,7 +490,7 @@ async def agent_add_payment_search_client_query(message: Message, state: FSMCont
     await state.clear()
     await _clear_flow_prompt(message, "payment_insert")
     if not items:
-        await message.answer("По этому запросу клиенты не найдены.", reply_markup=agent_menu())
+        await message.answer("По этому запросу клиенты не найдены.", reply_markup=agent_menu(show_back_to_admin=is_superadmin))
         return
 
     kb_rows: list[list[InlineKeyboardButton]] = []
@@ -500,7 +504,7 @@ async def agent_add_payment_search_client_query(message: Message, state: FSMCont
         kb_rows.append(row)
 
     await message.answer("Найденные клиенты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
-    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu())
+    await _set_reply_keyboard_silent_message(message, text="Выберите действие.", reply_markup=agent_menu(show_back_to_admin=is_superadmin))
 
 
 class ClientAdd(StatesGroup):

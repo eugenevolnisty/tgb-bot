@@ -24,7 +24,7 @@ class PropertyCalc(StatesGroup):
 
 async def _ensure_client(message: Message) -> bool:
     user = await get_or_create_user(message.from_user.id)
-    return user.role == UserRole.client
+    return user.role in {UserRole.client, UserRole.superadmin}
 
 
 @router.message(PropertyCalc.full_name)
@@ -90,7 +90,7 @@ async def step_value(message: Message, state: FSMContext) -> None:
 
 
 @router.message(PropertyCalc.comment)
-async def step_comment(message: Message, state: FSMContext) -> None:
+async def step_comment(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     text = (message.text or "").strip()
     if text.lower() == "нет":
         text = ""
@@ -137,5 +137,5 @@ async def step_comment(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     await message.answer("\n".join(lines), reply_markup=apply_quote_keyboard(saved.id))
-    await message.answer("Главное меню", reply_markup=client_menu())
+    await message.answer("Главное меню", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 

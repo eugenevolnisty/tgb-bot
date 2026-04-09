@@ -53,6 +53,20 @@ class AccessGuardMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        user_id = None
+        if isinstance(event, Message):
+            user_id = event.from_user.id
+        elif isinstance(event, CallbackQuery):
+            user_id = event.from_user.id
+
+        is_superadmin = False
+        if user_id is not None:
+            user = await get_or_create_user(user_id)
+            is_superadmin = user.role == UserRole.superadmin
+        data["is_superadmin"] = is_superadmin
+        if is_superadmin:
+            return await handler(event, data)
+
         if isinstance(event, Message):
             text = (event.text or "").strip()
             if text in self._agent_message_buttons:

@@ -62,7 +62,7 @@ async def payrep_callback(callback: CallbackQuery) -> None:
             )
         else:
             days = int(parts[1])
-            if days not in (1, 3, 7):
+            if days not in (1, 3, 7, 14):
                 await callback.answer("Некорректные данные", show_alert=True)
                 return
             end = today + timedelta(days=days)

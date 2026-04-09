@@ -25,7 +25,7 @@ class AppForm(StatesGroup):
 
 async def _ensure_client(message: Message) -> bool:
     user = await get_or_create_user(message.from_user.id)
-    return user.role == UserRole.client
+    return user.role in {UserRole.client, UserRole.superadmin}
 
 
 def entity_keyboard() -> "aiogram.types.InlineKeyboardMarkup":
@@ -54,11 +54,11 @@ async def start_application(message: Message, state: FSMContext) -> None:
 
 
 @router.message(F.text.casefold() == "отмена")
-async def cancel_any(message: Message, state: FSMContext) -> None:
+async def cancel_any(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     if await state.get_state() is None:
         return
     await state.clear()
-    await message.answer("Ок, отменил.", reply_markup=client_menu())
+    await message.answer("Ок, отменил.", reply_markup=client_menu(show_back_to_admin=is_superadmin))
 
 
 @router.callback_query(F.data.in_({"app:entity:person", "app:entity:company"}))
@@ -163,7 +163,7 @@ async def step_full_name(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AppForm.contact)
-async def step_contact(message: Message, state: FSMContext) -> None:
+async def step_contact(message: Message, state: FSMContext, is_superadmin: bool = False) -> None:
     text = (message.text or "").strip()
     if len(text) < 3:
         await message.answer("Укажи контакт (например: +375... или @username).")
@@ -231,5 +231,8 @@ async def step_contact(message: Message, state: FSMContext) -> None:
             pass
 
     await state.clear()
-    await message.answer(f"✅ Заявка №{app.id} создана и отправлена агенту.", reply_markup=client_menu())
+    await message.answer(
+        f"✅ Заявка №{app.id} создана и отправлена агенту.",
+        reply_markup=client_menu(show_back_to_admin=is_superadmin),
+    )
 
