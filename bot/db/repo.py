@@ -2870,7 +2870,8 @@ async def deactivate_insurance_company(
     company_id: int,
 ) -> bool:
     """
-    Мягкое удаление: is_active = False.
+    Мягкое удаление компании вместе с
+    зависимыми видами и тарифными картами.
     Проверить принадлежность тенанту.
     Возвращает True если успешно.
     """
@@ -2891,6 +2892,25 @@ async def deactivate_insurance_company(
             return False
 
         company.is_active = False
+
+        # Prevent orphaned active data from being used
+        # in "copy from another company" flows.
+        await session.execute(
+            update(InsuranceType)
+            .where(
+                InsuranceType.tenant_id == agent.tenant_id,
+                InsuranceType.company_id == company_id,
+            )
+            .values(is_active=False)
+        )
+        await session.execute(
+            update(TariffCard)
+            .where(
+                TariffCard.tenant_id == agent.tenant_id,
+                TariffCard.company_id == company_id,
+            )
+            .values(is_active=False)
+        )
         await session.commit()
         return True
 
@@ -3005,7 +3025,10 @@ async def list_insurance_types(
         if company_id is not None:
             stmt = stmt.where(InsuranceType.company_id == company_id)
         if active_only:
-            stmt = stmt.where(InsuranceType.is_active.is_(True))
+            stmt = stmt.where(
+                InsuranceType.is_active.is_(True),
+                InsuranceType.company.has(InsuranceCompany.is_active.is_(True)),
+            )
 
         res = await session.execute(stmt)
         return list(res.scalars().all())
@@ -3304,6 +3327,8 @@ async def list_tariff_cards(
             .where(
                 TariffCard.tenant_id == tenant_id,
                 TariffCard.is_active.is_(True),
+                TariffCard.company.has(InsuranceCompany.is_active.is_(True)),
+                TariffCard.insurance_type.has(InsuranceType.is_active.is_(True)),
             )
             .order_by(TariffCard.created_at.asc())
         )
